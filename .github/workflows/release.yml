@@ -30,6 +30,7 @@ jobs:
   # notarized artifacts the publish job ships.
   build:
     name: Build installers
+    if: github.repository == 'AprilNEA/OpenLogi'
     uses: ./.github/workflows/build.yml
     # Required so build.yml can read the 1Password / Azure / R2 signing secrets.
     secrets: inherit
@@ -43,7 +44,7 @@ jobs:
     name: Generate release notes
     # Tag runs only: the generator diffs from the previous tag, and its only
     # consumer (publish) is tag-gated too.
-    if: ${{ github.ref_type == 'tag' }}
+    if: ${{ github.repository == 'AprilNEA/OpenLogi' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
