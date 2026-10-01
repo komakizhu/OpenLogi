@@ -1,0 +1,61 @@
+name: Publish local application snapshot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'komakizhu/OpenLogi' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify archived application
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import zipfile
+          with zipfile.ZipFile('downloads/OpenLogi-macOS-arm64-0.8.3-20260929.091845.zip') as archive:
+              assert archive.testzip() is None
+              info = plistlib.loads(archive.read('OpenLogi.app/Contents/Info.plist'))
+              assert info['CFBundleShortVersionString'] == '0.8.3'
+              assert info['CFBundleVersion'] == '20260929.091845'
+              for executable in (
+                  'MacOS/openlogi-desktop',
+                  'MacOS/openlogi',
+                  'Library/LoginItems/OpenLogi Agent.app/Contents/MacOS/openlogi-agent',
+                  'Library/LoginItems/OpenLogi Overlay.app/Contents/MacOS/openlogi-overlay',
+              ):
+                  assert archive.getinfo('OpenLogi.app/Contents/' + executable).file_size > 0
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-macos-application
+          path: downloads/OpenLogi-macOS-arm64-0.8.3-20260929.091845.zip
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: local-macos-application
+          path: release-assets
+      - name: Publish archived application as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SNAPSHOT_COMMIT: ${{ github.sha }}
+        run: |
+          gh release create local-build-20260929.091845 \
+            release-assets/OpenLogi-macOS-arm64-0.8.3-20260929.091845.zip \
+            --target "$SNAPSHOT_COMMIT" \
+            --title "OpenLogi 0.8.3 — local macOS build (20260929.091845)" \
+            --notes-file downloads/RELEASE-NOTES.md \
+            --latest
