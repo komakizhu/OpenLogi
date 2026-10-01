@@ -56,8 +56,7 @@ pub(super) fn appearance_page(
                 tr!("appearance.app_icon"),
                 SettingField::render(move |_, _, cx| icon_picker(cx)),
             )
-            .layout(Axis::Vertical)
-            .description(tr!("appearance.app_icon_description")),
+            .layout(Axis::Vertical),
         );
     }
 

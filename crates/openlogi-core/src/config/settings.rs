@@ -105,9 +105,7 @@ impl AppIcon {
     /// Every icon, in the order Settings offers them.
     pub const ALL: [Self; 2] = [Self::Openlogi, Self::Prism];
 
-    /// Whether this is the icon the installed bundle already wears — the one
-    /// case a frontend applies by clearing its override rather than by handing
-    /// the system a file.
+    /// Whether this is the icon sealed into the installed bundle.
     #[must_use]
     pub fn is_default(self) -> bool {
         matches!(self, Self::Openlogi)

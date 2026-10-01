@@ -85,11 +85,10 @@ impl IconPipeline for AppBundle {
         fs_err::copy(&catalog, resources.join(CATALOG))
             .with_context(|| format!("could not copy {CATALOG} into the bundle"))?;
 
-        // Both bundle directories are assembled in place and reused, so a run
-        // of the app that applied an alternate leaves its custom icon behind —
-        // and `codesign` refuses a bundle carrying one ("resource fork, Finder
-        // information, or similar detritus"). A freshly built bundle wears what
-        // it was compiled with.
+        // Both bundle directories are assembled in place and reused. Older
+        // builds applied alternate Finder icons, which left custom icon data
+        // behind; `codesign` refuses a bundle carrying it ("resource fork,
+        // Finder information, or similar detritus").
         if appicon::has_custom_icon(app) {
             appicon::reset_file(app).context("could not clear the bundle's custom icon")?;
         }

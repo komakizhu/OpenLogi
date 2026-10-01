@@ -147,8 +147,7 @@ fn main() -> Result<()> {
         // event loop below.
         platform::updater::install(cx, &initial_config.app_settings);
 
-        // Wear the icon the user picked. An update replaces the bundle and
-        // takes the icon with it, so this is a repair as much as a restore.
+        // Restore the user's Dock icon without modifying the signed bundle.
         platform::app_icon::restore(initial_config.app_settings.app_icon);
 
         // On-demand GUI: quit when the last window closes. The agent stays

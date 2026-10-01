@@ -5525,7 +5525,6 @@ version = "0.8.3"
 dependencies = [
  "anyhow",
  "appcatalog",
- "appicon",
  "backon",
  "derive_more",
  "disclaim",
