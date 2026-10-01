@@ -19,6 +19,7 @@
 //! and Linux only ever start wanted, so their gate passes unconditionally.
 
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -59,6 +60,7 @@ const DORMANT_DEADLINE: Duration = Duration::from_secs(60);
 /// A failed event-tap install is normally transient (for example while the
 /// session's Accessibility service is settling). Keep trying while the hook
 /// is still wanted instead of waiting for another permission edge.
+#[cfg(target_os = "macos")]
 const HOOK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// An ordered device-I/O edge consumed by the lifecycle loop.
@@ -372,8 +374,12 @@ impl Armed {
         #[cfg(target_os = "macos")]
         request_input_monitoring().await;
         let mut device_io_gate = running.device_io_gate.clone();
-        let mut hook_retry = tokio::time::interval(HOOK_RETRY_INTERVAL);
-        hook_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        #[cfg(target_os = "macos")]
+        let mut hook_retry = {
+            let mut interval = tokio::time::interval(HOOK_RETRY_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval
+        };
 
         // HID++ watchers need no Accessibility — start them up front.
         startup::spawn_hidpp_watchers(&running.shared, &running.inputs);
@@ -381,6 +387,8 @@ impl Armed {
 
         info!("openlogi-agent started");
         loop {
+            #[cfg(target_os = "macos")]
+            let retry_hook = running.should_retry_hook();
             tokio::select! {
                 Some(event) = watchers.next() => {
                     running.apply_watcher(event, &inventory_refresh).await;
@@ -400,7 +408,15 @@ impl Armed {
                         break;
                     }
                 }
-                _ = hook_retry.tick(), if running.should_retry_hook() => {
+                () = async {
+                    #[cfg(target_os = "macos")]
+                    if retry_hook {
+                        hook_retry.tick().await;
+                        return;
+                    }
+                    std::future::pending::<()>().await;
+                } => {
+                    #[cfg(target_os = "macos")]
                     running.retry_hook().await;
                 }
                 Some(device_key) = running.inputs.triggers.recv() => {
@@ -506,34 +522,26 @@ impl Running {
     /// retried. The Accessibility watcher reports only stable permission
     /// changes, so a transient install failure needs this independent retry
     /// path to recover without another session or permission transition.
+    #[cfg(target_os = "macos")]
     fn should_retry_hook(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            hook_should_retry(
-                hook_should_be_installed(
-                    self.capture_mouse_events,
-                    self.accessibility_granted,
-                    self.device_io_gate.allows_io(),
-                ),
-                self.hook.as_ref().is_some_and(Hook::is_running),
-            )
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        hook_should_retry(
+            hook_should_be_installed(
+                self.capture_mouse_events,
+                self.accessibility_granted,
+                self.device_io_gate.allows_io(),
+            ),
+            self.hook.as_ref().is_some_and(Hook::is_running),
+        )
     }
 
     /// Retry a missing hook using the last stable Accessibility observation.
     /// A fresh native probe can transiently return `false` while the permission
     /// service settles; feeding that sample into `apply_accessibility` would
     /// poison the cached state and disable this retry path.
+    #[cfg(target_os = "macos")]
     async fn retry_hook(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
-            let accessibility_granted = self.accessibility_granted;
-            self.apply_accessibility(accessibility_granted).await;
-        }
+        let accessibility_granted = self.accessibility_granted;
+        self.apply_accessibility(accessibility_granted).await;
     }
 
     /// Fold one inventory-watcher event into the orchestrator.
@@ -640,18 +648,19 @@ impl Running {
             return None;
         }
         info!("accessibility granted — installing OS mouse hook");
-        hook::start(
+        let hook = hook::start(
             self.shared.hook_maps.clone(),
             self.shared.keyboard_bindings.clone(),
             self.inputs.dispatcher.clone(),
             self.inputs.scroll_input.clone(),
             Arc::clone(&self.event_monitor),
             self.shared.device_io.clone(),
-        )
-        .inspect(|hook| {
-            #[cfg(target_os = "macos")]
+        );
+        #[cfg(target_os = "macos")]
+        if let Some(hook) = &hook {
             self.hook_stop.install(&hook.stop_handle());
-        })
+        }
+        hook
     }
 
     /// Stop the hook so no new edge can race the lifecycle cancellation.
@@ -683,6 +692,7 @@ const fn hook_should_be_installed(
 
 /// A failed install is retryable only while the hook is still wanted and no
 /// live handle exists.
+#[cfg(any(target_os = "macos", test))]
 const fn hook_should_retry(hook_wanted: bool, hook_running: bool) -> bool {
     hook_wanted && !hook_running
 }
