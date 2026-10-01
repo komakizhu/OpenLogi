@@ -1,10 +1,12 @@
+> This is inherited upstream documentation. For this independent fork, its changes, artwork, and release status, see [the fork README](../README.md).
+
 > [!WARNING]
 > **OpenLogi 仍在积极开发中**，尚未稳定 —— 功能与配置仍可能变动。点个 **Star** ⭐ 并 **Watch** 👀 本仓库，在新版本发布时获得通知。
 
 <h4 align="right"><a href="../README.md">English</a> | <strong>简体中文</strong> | <a href="README.ja.md">日本語</a> | <a href="README.de.md">Deutsch</a> | <a href="README.fr.md">Français</a> | <a href="README.ko.md">한국어</a></h4>
 
 <p align="center">
-    <img src="https://assets.openlogi.org/brand/openlogi-icon.png" width="138" alt="OpenLogi"/>
+    <img src="../design/icon/openlogi-128.png" width="138" alt="OpenLogi"/>
 </p>
 
 <h1 align="center">OpenLogi</h1>
@@ -164,10 +166,11 @@ Windows 支持可正常工作，并已在 Windows 11 实机上完成端到端验
 
 `crates/openlogi-hidpp` 是 [`hidpp`](https://crates.io/crates/hidpp)（作者 [@lus](https://github.com/lus)）的 vendored fork，采用 0BSD 许可证。
 
-### Logo 与品牌资产
+### Fork artwork
 
-感谢 [@kubai087](https://github.com/kubai087) 为 OpenLogi 设计的 Logo，该 Logo —— 即 [`design/`](../design/) 下的品牌资产 —— © 2026 AprilNEA 保留所有权利，不在上述 MIT/Apache 许可范围内，许可证详见 [`design/LICENSE`](../design/LICENSE)。
-Fork 代码并不授予 OpenLogi 名称、Logo 或图标的使用权，未经事先书面许可，请勿用它们代表你自己的项目、Fork 或分发版本。
+The current artwork is original LogiLocal artwork licensed under MIT; see
+[design/LICENSE](../design/LICENSE). Historical upstream OpenLogi assets retain
+their proprietary license. See [the fork README](../README.md) for attribution.
 
 ---
 

@@ -1,12 +1,11 @@
 //! Application icon integration.
 //!
 //! The bundle ships every alternate under `Contents/Resources/Icons`, compiled
-//! by `cargo xtask macos icon`; applying one hands its `.icns` to macOS through
-//! [`appicon`], which sets both the Dock tile of this process and the icon
-//! Finder and Launchpad read. Nothing here is fatal: an icon that cannot be
-//! applied — a bundle owned by another user, a build without the alternates —
-//! leaves the app wearing what it was signed with, which is a cosmetic loss
-//! rather than a reason to fail a launch.
+//! by `cargo xtask macos icon`; applying one changes only this process's Dock
+//! icon. A Finder custom icon writes metadata onto the signed app bundle and
+//! invalidates its signature, which can prevent launchd from starting the
+//! embedded agent. Nothing here is fatal: a missing icon leaves the app wearing
+//! what it was signed with.
 //!
 //! The profile switcher also resolves other installed applications through
 //! Launch Services so their real Finder icons can identify per-app profiles.
@@ -15,17 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use openlogi_core::config::AppIcon;
+#[cfg(target_os = "macos")]
 use tracing::{debug, warn};
 
-/// Re-apply the persisted choice at startup.
-///
-/// The default is applied by touching *nothing*. The bundle already wears it,
-/// and a user who pasted their own icon onto the app in Finder gets to keep it
-/// — an app that resets its icon on every launch quietly overwrites that, which
-/// is the complaint Arc's icon picker collects.
-///
-/// A non-default choice is re-applied every launch on purpose: replacing the
-/// bundle drops the icon, and an update does exactly that.
+/// Re-apply the persisted choice to this process's Dock tile at startup.
 pub fn restore(icon: AppIcon) {
     if icon.is_default() {
         return;
@@ -33,26 +25,57 @@ pub fn restore(icon: AppIcon) {
     apply(icon);
 }
 
-/// Apply a choice the user just made, the default included — picking it back is
-/// an explicit request to drop whatever icon the bundle is wearing.
+/// Apply a choice the user just made without changing the signed bundle.
 pub fn apply(icon: AppIcon) {
-    let outcome = if icon.is_default() {
-        appicon::reset()
-    } else {
-        let Some(icns) = alternate(icon) else {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::AnyThread as _;
+        use objc2_app_kit::{NSApplication, NSImage};
+        use objc2_foundation::{MainThreadMarker, NSString};
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            warn!(%icon, "could not apply the Dock icon off the main thread");
+            return;
+        };
+        let Some(icns) = dock_icon(icon) else {
             warn!(%icon, "the bundle ships no icon by that name; leaving the icon alone");
             return;
         };
-        appicon::set(appicon::Icon::File(&icns))
-    };
-    match outcome {
-        Ok(()) => debug!(%icon, "app icon applied"),
-        Err(error) => warn!(%icon, %error, "could not apply the app icon"),
+        let path = NSString::from_str(&icns.to_string_lossy());
+        let Some(image) = NSImage::initWithContentsOfFile(NSImage::alloc(), &path) else {
+            warn!(%icon, path = %icns.display(), "could not load the Dock icon");
+            return;
+        };
+        #[expect(
+            unsafe_code,
+            reason = "AppKit's Dock-icon setter is unsafe for a null image"
+        )]
+        // SAFETY: `image` is a live NSImage; AppKit receives Some, not the
+        // potentially unsupported None, and the main-thread marker proves
+        // this is running on the AppKit thread.
+        unsafe {
+            NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
+        }
+        debug!(%icon, "Dock icon applied");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = icon;
+}
+
+#[cfg(target_os = "macos")]
+fn dock_icon(icon: AppIcon) -> Option<PathBuf> {
+    if icon.is_default() {
+        let exe = std::env::current_exe().ok()?;
+        let path = exe.parent()?.parent()?.join("Resources/AppIcon.icns");
+        path.is_file().then_some(path)
+    } else {
+        alternate(icon)
     }
 }
 
 /// The alternate's `.icns` inside this app bundle, `None` when the running
 /// binary is not in one that ships it.
+#[cfg(target_os = "macos")]
 fn alternate(icon: AppIcon) -> Option<PathBuf> {
     icons_dir(format!("{icon}.icns"))
 }

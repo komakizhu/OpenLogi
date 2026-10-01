@@ -10,7 +10,6 @@ use gpui_component::{
     IconName, Sizable as _,
     button::{Toggle, ToggleVariants as _},
     h_flex,
-    menu::ContextMenuExt as _,
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -18,8 +17,8 @@ use openlogi_core::config::DeviceViewMode;
 use openlogi_core::device::DeviceKind;
 
 use super::{
-    AppView, connection_summary, connection_view, custom_model_subtitle, device_card, device_image,
-    device_menu, device_menu_button, device_ring, keyboard_glow, kind_badge,
+    AppView, connection_summary, connection_view, custom_model_subtitle, device_card,
+    device_context_menu, device_image, device_menu_button, device_ring, keyboard_glow, kind_badge,
 };
 use crate::state::{AppState, DeviceRecord, StateEvent};
 use crate::ui::battery::{BatteryIndicator, battery_charging_no_reading};
@@ -55,19 +54,19 @@ pub(super) fn device_view_switcher(
         toggle(
             "device-view-grid",
             IconName::LayoutDashboard,
-            tr!("Grid"),
+            tr!("common.grid"),
             DeviceViewMode::Grid,
         ),
         toggle(
             "device-view-list",
             IconName::Menu,
-            tr!("List"),
+            tr!("common.list"),
             DeviceViewMode::List,
         ),
         toggle(
             "device-view-carousel",
             IconName::GalleryVerticalEnd,
-            tr!("Carousel"),
+            tr!("common.carousel"),
             DeviceViewMode::Carousel,
         ),
     ])
@@ -109,11 +108,11 @@ fn device_grid(cx: &mut Context<AppView>) -> impl IntoElement {
         ordered_device_indices(state.devices())
             .into_iter()
             .map(|idx| {
-                device_card_element(state, idx, active_idx, view.clone(), pal)
+                let card = device_card_element(state, idx, active_idx, view.clone(), pal)
                     .min_w(theme::GALLERY_CARD_MIN_W)
                     .max_w(theme::GALLERY_CARD_MAX_W)
-                    .flex_1()
-                    .context_menu(device_menu(&state.devices()[idx]))
+                    .flex_1();
+                device_context_menu(card, &state.devices()[idx], pal)
             })
             .collect()
     });
@@ -144,8 +143,11 @@ fn device_list(cx: &mut Context<AppView>) -> impl IntoElement {
         ordered_device_indices(state.devices())
             .into_iter()
             .map(|idx| {
-                device_list_row(state, idx, active_idx, view.clone(), pal)
-                    .context_menu(device_menu(&state.devices()[idx]))
+                device_context_menu(
+                    device_list_row(state, idx, active_idx, view.clone(), pal),
+                    &state.devices()[idx],
+                    pal,
+                )
             })
             .collect()
     });
@@ -194,9 +196,12 @@ fn device_carousel(cx: &mut Context<AppView>) -> impl IntoElement {
                     return div().into_any_element();
                 };
                 let active_idx = state.selected_device_index().unwrap_or(0);
-                device_card_element(state, idx, active_idx, view.clone(), pal)
-                    .context_menu(device_menu(&state.devices()[idx]))
-                    .into_any_element()
+                device_context_menu(
+                    device_card_element(state, idx, active_idx, view.clone(), pal),
+                    &state.devices()[idx],
+                    pal,
+                )
+                .into_any_element()
             })
             .on_select(cx.listener(move |_, position: &usize, _, cx| {
                 let Some(&idx) = select_order.get(*position) else {
@@ -346,9 +351,9 @@ fn device_list_row(
 
 fn device_accessibility_description(record: &DeviceRecord) -> SharedString {
     let status = if record.online {
-        tr!("Connected")
+        tr!("device.connected")
     } else {
-        tr!("Offline")
+        tr!("device.offline")
     };
     let identity = if record.display_name == record.model_name {
         super::kind_label(record.kind)
@@ -358,11 +363,15 @@ fn device_accessibility_description(record: &DeviceRecord) -> SharedString {
     let metadata = format!("{status}. {identity}. {}.", connection_summary(record));
     if let Some(battery) = record.battery.as_ref() {
         let battery = if battery_charging_no_reading(battery) {
-            tr!("Charging").to_string()
+            tr!("device.charging").to_string()
         } else if record.online {
-            format!("{} {}%", tr!("Battery"), battery.percentage)
+            format!("{} {}%", tr!("device.battery"), battery.percentage)
         } else {
-            format!("{} {}%", tr!("Last known battery"), battery.percentage)
+            format!(
+                "{} {}%",
+                tr!("device.last_known_battery"),
+                battery.percentage
+            )
         };
         format!("{metadata} {battery}.").into()
     } else {

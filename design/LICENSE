@@ -1,18 +1,26 @@
-OpenLogi Brand Assets — All Rights Reserved
+LogiLocal Fork Artwork — MIT License
 
-Copyright © 2026 AprilNEA. All rights reserved.
+Copyright (c) 2026 komakizhu
 
-This directory contains the OpenLogi brand assets: the logo, the application
-icon, and related design materials.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-These assets are NOT covered by the MIT or Apache License 2.0 that apply to the
-OpenLogi source code, and no license to them is granted by those licenses or by
-this file. All rights are reserved by the copyright holder.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-You may not copy, modify, distribute, or otherwise use these assets — including
-to identify or represent your own projects, forks, products, or distributions —
-without prior written permission from the copyright holder.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
-The only use permitted without prior permission is unaltered reproduction when
-referring to the OpenLogi project itself (for example, linking to it or writing
-about it).
+Historical upstream OpenLogi brand assets in Git history remain copyright
+2026 AprilNEA, all rights reserved, under their original proprietary license.
+This license applies only to the independently generated artwork in the current tree,
+including the agent tray glyphs and bundled AppIcon.icns generated from these sources.

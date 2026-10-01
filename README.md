@@ -1,43 +1,29 @@
-> [!WARNING]
-> **OpenLogi is under active development** and not yet stable — features and config may still change. Give the repo a **Star** ⭐ and **Watch** 👀 it to get notified when a new release lands.
+# LogiLocal — an independent OpenLogi fork
 
-<h4 align="right"><strong>English</strong> | <a href="docs/README.zh-CN.md">简体中文</a> | <a href="docs/README.ja.md">日本語</a> | <a href="docs/README.de.md">Deutsch</a> | <a href="docs/README.fr.md">Français</a> | <a href="docs/README.ko.md">한국어</a></h4>
+![LogiLocal icon](design/icon/openlogi-128.png)
 
-<p align="center">
-    <img src="https://assets.openlogi.org/brand/openlogi-icon.png" width="138" alt="OpenLogi"/>
-</p>
+This repository is [komakizhu's maintained fork](https://github.com/komakizhu/OpenLogi)
+of [AprilNEA/OpenLogi](https://github.com/AprilNEA/OpenLogi). It is not an official
+OpenLogi release and is not affiliated with the upstream maintainers or Logitech.
+The original Git history, authorship, MIT/Apache-2.0 licenses, and 0BSD notices are preserved.
 
-<h1 align="center">OpenLogi</h1>
-<p align="center"><strong>⚡️ A native, local-first alternative to Logitech Options+, written in Rust 🦀<br/>Unlock the full capabilities of Logitech mice, keyboards, and webcams over HID++ and UVC</strong></p>
+This source publication includes our local macOS session/input-hook recovery fixes,
+agent-launch recovery, device-menu and dialog fixes, and a Dock icon picker that
+keeps signed bundles intact. It retains upstream functionality and technical
+identifiers for compatibility. No fork installer or binary release is published yet. Upstream release workflows
+are restricted to the upstream repository; this fork keeps CI enabled.
+Use the development channel when building locally; production bundle identities
+and the upstream updater have not been migrated to an independent release channel.
+Do not configure an upstream update signing key for fork builds.
 
-<div align="center">
-    <a href="https://twitter.com/AprilNEA" target="_blank">
-    <img alt="twitter" src="https://img.shields.io/badge/follow-AprilNEA-green?style=social&logo=Twitter"></a>
-    <a href="https://t.me/+VDtkR5OSAT04NzVh" target="_blank">
-    <img alt="telegram" src="https://img.shields.io/badge/chat-telegram-blueviolet?style=flat&logo=Telegram"></a>
-    <a href="https://github.com/AprilNEA/OpenLogi/releases" target="_blank">
-    <img alt="GitHub downloads" src="https://img.shields.io/github/downloads/AprilNEA/OpenLogi/total.svg?style=flat"></a>
-    <a href="https://github.com/AprilNEA/OpenLogi/commits" target="_blank">
-    <img alt="GitHub commit" src="https://img.shields.io/github/commit-activity/m/AprilNEA/OpenLogi?style=flat"></a>
-    <img alt="Hits" src="https://hits.aprilnea.com/hits?url=https://github.com/aprilnea/openlogi">
-</div>
+The artwork in the current tree is original LogiLocal artwork, licensed under MIT.
+Historical OpenLogi brand assets remain proprietary to their original owners;
+their presence in inherited Git history grants no permission to reuse them.
 
-<p align="center">
-    <a href="https://trendshift.io/repositories/42303" target="_blank">
-    <img src="https://trendshift.io/api/badge/repositories/42303" alt="AprilNEA%2FOpenLogi | Trendshift" width="250" height="55"/></a>
-    <a href="https://www.producthunt.com/products/openlogi?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-openlogi" target="_blank" rel="noopener noreferrer">
-    <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=openlogi&amp;theme=dark&amp;period=daily">
-        <source media="(prefers-color-scheme: light)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=openlogi&amp;theme=light&amp;period=daily">
-        <img alt="OpenLogi - A local-first alternative to Logitech Options+ | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=openlogi&amp;theme=light&amp;period=daily">
-    </picture></a>
-</p>
-
-> **Fed up with Options+? Try OpenLogi.**
-
-Runs on macOS, Linux, and Windows.
-
----
+Build instructions: [developer handbook](docs/DEVELOPMENT.md).
+[Publication validation and hardware test instructions](docs/FORK-VALIDATION.md).
+[中文 fork 说明](docs/FORK.zh-CN.md). The feature documentation below describes the
+inherited OpenLogi implementation; upstream downloads are upstream builds.
 
 ## Beyond Options+
 
@@ -216,19 +202,14 @@ at your option.
 `crates/openlogi-hidpp` is a vendored fork of [`hidpp`](https://crates.io/crates/hidpp)
 by [@lus](https://github.com/lus), licensed 0BSD.
 
-### Logo & brand assets
+### Fork artwork
 
-Thanks to [@kubai087](https://github.com/kubai087) for designing the OpenLogi
-logo. The OpenLogi logo and app icon (the brand assets under
-[`design/`](design/)) are © 2026 AprilNEA, all rights reserved, and are not covered by the MIT/Apache
-licenses above; see [`design/LICENSE`](design/LICENSE). Forking the code grants
-no right to the OpenLogi name, logo, or icon; please don't use them to represent
-your own projects, forks, or distributions without prior written permission.
+Current `design/` artwork and the bundled app icon are original LogiLocal assets
+by komakizhu, licensed under MIT; see [design/LICENSE](design/LICENSE).
+They were generated independently with [tools/generate-fork-art.py](tools/generate-fork-art.py).
+Upstream OpenLogi names and branding belong to their respective owners; the
+upstream artwork in inherited history retains its original proprietary license.
 
 ---
 
 **Not affiliated with Logitech.** "Logitech", "MX Master", and "Options+" are trademarks of Logitech International S.A.
-
-## Repo activity
-
-![Repobeats analytics image](https://repobeats.com/AprilNEA/OpenLogi "Repobeats analytics image")
