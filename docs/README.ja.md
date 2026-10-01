@@ -1,10 +1,12 @@
+> This is inherited upstream documentation. For this independent fork, its changes, artwork, and release status, see [the fork README](../README.md).
+
 > [!WARNING]
 > **OpenLogi は現在活発に開発中**であり、まだ安定していません —— 機能や設定は今後も変わる可能性があります。リポジトリに **Star** ⭐ と **Watch** 👀 を付けて、新しいリリースの通知を受け取りましょう。
 
 <h4 align="right"><a href="../README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <strong>日本語</strong> | <a href="README.de.md">Deutsch</a> | <a href="README.fr.md">Français</a> | <a href="README.ko.md">한국어</a></h4>
 
 <p align="center">
-    <img src="https://assets.openlogi.org/brand/openlogi-icon.png" width="138" alt="OpenLogi"/>
+    <img src="../design/icon/openlogi-128.png" width="138" alt="OpenLogi"/>
 </p>
 
 <h1 align="center">OpenLogi</h1>
@@ -164,9 +166,11 @@ Windows サポートは動作しており、有線キーボードと Unifying �
 
 `crates/openlogi-hidpp` は [`hidpp`](https://crates.io/crates/hidpp)（作者 [@lus](https://github.com/lus)）の vendored fork で、0BSD ライセンスです。
 
-### ロゴとブランドアセット
+### Fork artwork
 
-OpenLogi のロゴをデザインしてくれた [@kubai087](https://github.com/kubai087) に感謝します。OpenLogi のロゴとアプリアイコン —— [`design/`](../design/) 配下のブランドアセット —— は © 2026 AprilNEA が全権利を留保しており、上記の MIT/Apache ライセンスの対象外です。[`design/LICENSE`](../design/LICENSE) を参照してください。コードをフォークしても OpenLogi の名称・ロゴ・アイコンの使用権は付与されません。事前の書面による許可なく、ご自身のプロジェクト、フォーク、配布物を表すために使用しないでください。
+The current artwork is original LogiLocal artwork licensed under MIT; see
+[design/LICENSE](../design/LICENSE). Historical upstream OpenLogi assets retain
+their proprietary license. See [the fork README](../README.md) for attribution.
 
 ---
 

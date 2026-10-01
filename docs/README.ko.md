@@ -1,10 +1,12 @@
+> This is inherited upstream documentation. For this independent fork, its changes, artwork, and release status, see [the fork README](../README.md).
+
 > [!WARNING]
 > **OpenLogi는 활발히 개발 중**이며 아직 안정 단계가 아닙니다 — 기능과 설정이 변경될 수 있습니다. 저장소에 **Star** ⭐ 와 **Watch** 👀 를 눌러 두면 새 릴리스가 나올 때 알림을 받을 수 있습니다.
 
 <h4 align="right"><a href="../README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ja.md">日本語</a> | <a href="README.de.md">Deutsch</a> | <a href="README.fr.md">Français</a> | <strong>한국어</strong></h4>
 
 <p align="center">
-    <img src="https://assets.openlogi.org/brand/openlogi-icon.png" width="138" alt="OpenLogi"/>
+    <img src="../design/icon/openlogi-128.png" width="138" alt="OpenLogi"/>
 </p>
 
 <h1 align="center">OpenLogi</h1>
@@ -164,9 +166,11 @@ Windows 지원은 정상 작동하며 유선 키보드와 Unifying 수신기 마
 
 `crates/openlogi-hidpp`는 [`hidpp`](https://crates.io/crates/hidpp)([@lus](https://github.com/lus) 제작)의 vendored fork이며, 0BSD 라이선스를 따릅니다.
 
-### 로고 및 브랜드 자산
+### Fork artwork
 
-OpenLogi 로고를 디자인해 준 [@kubai087](https://github.com/kubai087)에게 감사드립니다. OpenLogi 로고와 앱 아이콘 — [`design/`](../design/) 아래의 브랜드 자산 — 은 © 2026 AprilNEA가 모든 권리를 보유하며, 위 MIT/Apache 라이선스의 적용을 받지 않습니다. [`design/LICENSE`](../design/LICENSE)를 참고하세요. 코드를 포크해도 OpenLogi 이름·로고·아이콘에 대한 권리는 부여되지 않습니다. 사전 서면 허가 없이 자신의 프로젝트, 포크, 배포판을 나타내는 데 사용하지 마세요.
+The current artwork is original LogiLocal artwork licensed under MIT; see
+[design/LICENSE](../design/LICENSE). Historical upstream OpenLogi assets retain
+their proprietary license. See [the fork README](../README.md) for attribution.
 
 ---
 

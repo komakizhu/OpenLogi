@@ -1,10 +1,12 @@
+> This is inherited upstream documentation. For this independent fork, its changes, artwork, and release status, see [the fork README](../README.md).
+
 > [!WARNING]
 > **OpenLogi befindet sich in aktiver Entwicklung** und ist noch nicht stabil — Funktionen und Konfiguration können sich noch ändern. Gib dem Repo einen **Star** ⭐ und **beobachte** 👀 es, um benachrichtigt zu werden, wenn ein neues Release erscheint.
 
 <h4 align="right"><a href="../README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ja.md">日本語</a> | <strong>Deutsch</strong> | <a href="README.fr.md">Français</a> | <a href="README.ko.md">한국어</a></h4>
 
 <p align="center">
-    <img src="https://assets.openlogi.org/brand/openlogi-icon.png" width="138" alt="OpenLogi"/>
+    <img src="../design/icon/openlogi-128.png" width="138" alt="OpenLogi"/>
 </p>
 
 <h1 align="center">OpenLogi</h1>
@@ -165,9 +167,11 @@ Der Code in diesem Repository ist doppelt lizenziert, wahlweise unter
 `crates/openlogi-hidpp` ist ein eingebundener Fork von [`hidpp`](https://crates.io/crates/hidpp)
 von [@lus](https://github.com/lus), lizenziert unter 0BSD.
 
-### Logo & Markenressourcen
+### Fork artwork
 
-Danke an [@kubai087](https://github.com/kubai087) für das Design des OpenLogi-Logos. Das OpenLogi-Logo und das App-Icon — die Markenressourcen unter [`design/`](../design/) — sind © 2026 AprilNEA, alle Rechte vorbehalten, und fallen nicht unter die obigen MIT-/Apache-Lizenzen; siehe [`design/LICENSE`](../design/LICENSE). Ein Fork des Codes gewährt kein Recht am Namen, Logo oder Icon von OpenLogi; bitte verwende sie nicht ohne vorherige schriftliche Erlaubnis für eigene Projekte, Forks oder Distributionen.
+The current artwork is original LogiLocal artwork licensed under MIT; see
+[design/LICENSE](../design/LICENSE). Historical upstream OpenLogi assets retain
+their proprietary license. See [the fork README](../README.md) for attribution.
 
 ---
 
