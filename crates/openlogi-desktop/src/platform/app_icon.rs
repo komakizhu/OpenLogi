@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use openlogi_core::config::AppIcon;
+#[cfg(target_os = "macos")]
 use tracing::{debug, warn};
 
 /// Re-apply the persisted choice to this process's Dock tile at startup.
@@ -74,6 +75,7 @@ fn dock_icon(icon: AppIcon) -> Option<PathBuf> {
 
 /// The alternate's `.icns` inside this app bundle, `None` when the running
 /// binary is not in one that ships it.
+#[cfg(target_os = "macos")]
 fn alternate(icon: AppIcon) -> Option<PathBuf> {
     icons_dir(format!("{icon}.icns"))
 }
