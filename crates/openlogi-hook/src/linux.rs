@@ -51,7 +51,7 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::{
     ButtonId, CursorPosition, EventDisposition, ForegroundApp, HookBackend, HookError, HookEvent,
-    LOGITECH_VENDOR_ID, MouseEvent,
+    HookEventInterests, LOGITECH_VENDOR_ID, MouseEvent,
 };
 
 /// Prefix carried by every uinput device OpenLogi creates — the hook's
@@ -84,6 +84,7 @@ impl HookBackend for Backend {
 
     fn start(
         cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+        _interests: HookEventInterests,
     ) -> Result<HookInner, HookError> {
         let devices = find_mouse_devices();
         if devices.is_empty() {

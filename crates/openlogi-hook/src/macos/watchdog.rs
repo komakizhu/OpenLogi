@@ -22,6 +22,8 @@ pub(super) enum TapPhase {
     /// The tap thread is creating or activating a tap that may already exist.
     Arming,
     Armed,
+    /// Replacing the event mask on the tap's owning thread.
+    Reconfiguring,
     TapStopped,
     ThreadExited,
 }
@@ -38,35 +40,111 @@ impl TapPhase {
             0 => Self::Starting,
             1 => Self::Arming,
             2 => Self::Armed,
-            3 => Self::TapStopped,
+            3 => Self::Reconfiguring,
+            4 => Self::TapStopped,
             _ => Self::ThreadExited,
         }
     }
 }
 
-/// Whether the tap callback is idle or the monotonic millisecond when it entered.
-///
-/// Zero is idle; [`WatchdogSignals::now_millis`] reserves nonzero values for
-/// entries. One Release store publishes each whole state, so an Acquire load
-/// cannot observe "entered" without its matching timestamp as it could with
-/// separate flag and timestamp atomics.
-#[derive(Debug, Default)]
-pub(super) struct CallbackActivity(AtomicU64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum CallbackKind {
+    Button = 0,
+    Scroll = 1,
+    PointerMotion = 2,
+    Keyboard = 3,
+    Other = 4,
+}
 
-impl CallbackActivity {
-    pub fn enter(&self, entered_at_ms: u64) {
-        debug_assert_ne!(entered_at_ms, 0);
-        self.0.store(entered_at_ms, Ordering::Release);
+impl CallbackKind {
+    const fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::Button,
+            1 => Self::Scroll,
+            2 => Self::PointerMotion,
+            3 => Self::Keyboard,
+            _ => Self::Other,
+        }
     }
 
-    pub fn exit(&self) {
-        self.0.store(0, Ordering::Release);
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Button => "button",
+            Self::Scroll => "scroll",
+            Self::PointerMotion => "pointer_motion",
+            Self::Keyboard => "keyboard",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CallbackMetrics {
+    pub buttons: u64,
+    pub scroll: u64,
+    pub pointer_motion: u64,
+    pub keyboard: u64,
+    pub other: u64,
+    pub max_duration_nanos: u64,
+}
+
+/// Callback activity and cheap counters for diagnostics. The timestamp is
+/// stored last on entry and cleared last on exit, so watchdog readers see a
+/// complete active sample while the diagnostic counters remain independent.
+#[derive(Debug)]
+pub(super) struct CallbackActivity {
+    entered_at_ms: AtomicU64,
+    active_kind: AtomicU8,
+    counts: [AtomicU64; 5],
+    max_duration_nanos: AtomicU64,
+}
+
+impl Default for CallbackActivity {
+    fn default() -> Self {
+        Self {
+            entered_at_ms: AtomicU64::new(0),
+            active_kind: AtomicU8::new(CallbackKind::Other as u8),
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            max_duration_nanos: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CallbackActivity {
+    pub fn enter(&self, entered_at_ms: u64, kind: CallbackKind) {
+        debug_assert_ne!(entered_at_ms, 0);
+        self.active_kind.store(kind as u8, Ordering::Relaxed);
+        self.counts[kind as usize].fetch_add(1, Ordering::Relaxed);
+        self.entered_at_ms.store(entered_at_ms, Ordering::Release);
+    }
+
+    pub fn exit(&self, duration_nanos: u64) {
+        self.max_duration_nanos
+            .fetch_max(duration_nanos, Ordering::Relaxed);
+        self.entered_at_ms.store(0, Ordering::Release);
     }
 
     pub fn entered_at_ms(&self) -> Option<u64> {
-        match self.0.load(Ordering::Acquire) {
+        match self.entered_at_ms.load(Ordering::Acquire) {
             0 => None,
             entered_at_ms => Some(entered_at_ms),
+        }
+    }
+
+    pub fn active_kind(&self) -> CallbackKind {
+        CallbackKind::from_raw(self.active_kind.load(Ordering::Acquire))
+    }
+
+    pub fn take_metrics(&self) -> CallbackMetrics {
+        CallbackMetrics {
+            buttons: self.counts[CallbackKind::Button as usize].swap(0, Ordering::Relaxed),
+            scroll: self.counts[CallbackKind::Scroll as usize].swap(0, Ordering::Relaxed),
+            pointer_motion: self.counts[CallbackKind::PointerMotion as usize]
+                .swap(0, Ordering::Relaxed),
+            keyboard: self.counts[CallbackKind::Keyboard as usize].swap(0, Ordering::Relaxed),
+            other: self.counts[CallbackKind::Other as usize].swap(0, Ordering::Relaxed),
+            max_duration_nanos: self.max_duration_nanos.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -105,6 +183,10 @@ impl WatchdogSignals {
         u64::try_from(self.now().as_millis())
             .unwrap_or(u64::MAX - 1)
             .saturating_add(1)
+    }
+
+    pub fn now_nanos(&self) -> u64 {
+        u64::try_from(self.now().as_nanos()).unwrap_or(u64::MAX)
     }
 
     pub fn phase(&self) -> TapPhase {
@@ -186,7 +268,8 @@ impl LifecycleWatchdog {
         match observation.phase {
             TapPhase::Starting => return LifecycleDecision::Continue,
             TapPhase::ThreadExited => return LifecycleDecision::Complete,
-            TapPhase::Arming | TapPhase::Armed | TapPhase::TapStopped => {}
+            TapPhase::Arming | TapPhase::Armed | TapPhase::Reconfiguring | TapPhase::TapStopped => {
+            }
         }
 
         if observation.stop_requested {
@@ -198,7 +281,10 @@ impl LifecycleWatchdog {
 
         let timeout = if let Some(stopped) = self.stop_at {
             Some((LifecycleExitReason::StopTimedOut, stopped))
-        } else if matches!(observation.phase, TapPhase::Arming | TapPhase::Armed) {
+        } else if matches!(
+            observation.phase,
+            TapPhase::Arming | TapPhase::Armed | TapPhase::Reconfiguring
+        ) {
             Some((
                 LifecycleExitReason::TapThreadStalled,
                 observation.tap_progress_at,
@@ -259,9 +345,10 @@ mod tests {
         assert_eq!(TapPhase::decode(0), TapPhase::Starting);
         assert_eq!(TapPhase::decode(1), TapPhase::Arming);
         assert_eq!(TapPhase::decode(2), TapPhase::Armed);
-        assert_eq!(TapPhase::decode(3), TapPhase::TapStopped);
-        assert_eq!(TapPhase::decode(4), TapPhase::ThreadExited);
-        assert_eq!(TapPhase::decode(5), TapPhase::Armed);
+        assert_eq!(TapPhase::decode(3), TapPhase::Reconfiguring);
+        assert_eq!(TapPhase::decode(4), TapPhase::TapStopped);
+        assert_eq!(TapPhase::decode(5), TapPhase::ThreadExited);
+        assert_eq!(TapPhase::decode(6), TapPhase::Armed);
         assert_eq!(TapPhase::decode(u8::MAX), TapPhase::Armed);
 
         let signals = WatchdogSignals::default();
@@ -274,14 +361,25 @@ mod tests {
         let activity = CallbackActivity::default();
         assert_eq!(activity.entered_at_ms(), None);
 
-        activity.enter(42);
+        activity.enter(42, CallbackKind::Button);
         assert_eq!(activity.entered_at_ms(), Some(42));
+        assert_eq!(activity.active_kind(), CallbackKind::Button);
 
-        activity.enter(43);
+        activity.enter(43, CallbackKind::Keyboard);
         assert_eq!(activity.entered_at_ms(), Some(43));
+        assert_eq!(activity.active_kind(), CallbackKind::Keyboard);
 
-        activity.exit();
+        activity.exit(1_200);
         assert_eq!(activity.entered_at_ms(), None);
+        assert_eq!(
+            activity.take_metrics(),
+            CallbackMetrics {
+                buttons: 1,
+                keyboard: 1,
+                max_duration_nanos: 1_200,
+                ..CallbackMetrics::default()
+            }
+        );
     }
 
     fn observation(

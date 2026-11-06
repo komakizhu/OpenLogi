@@ -17,7 +17,9 @@ use std::sync::{Arc, RwLock};
 use openlogi_core::app::ForegroundApp;
 use openlogi_core::binding::{Action, Binding};
 use openlogi_core::bindings::{button_bindings_for, oshook_gestures_for};
-use openlogi_core::config::{Config, LightSettings, ScrollResolution, canonical_device_key};
+use openlogi_core::config::{
+    Config, LightSettings, ScrollResolution, VerticalScrollSensitivity, canonical_device_key,
+};
 use openlogi_core::device::{
     Capabilities, DeviceInventory, DeviceKind, LightCapabilities, StandaloneDevice,
 };
@@ -26,6 +28,7 @@ use openlogi_hid::{
     CaptureChannel, ChannelPool, ChannelRegistry, DIRECT_DEVICE_INDEX, DeviceIoGate, DeviceRoute,
     KEYBOARD_KEY_CIDS,
 };
+use openlogi_hook::HookEventInterests;
 use openlogi_ipc::InventoryHealth;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -75,9 +78,14 @@ pub struct SharedRuntime {
     /// rebuild publishes both atomically (see [`HookMaps`]). Also read by the
     /// gesture watcher for the thumb-wheel/DPI-button single actions.
     pub hook_maps: SharedHookMaps,
+    /// Lock-free generation for callback-side cancellation when maps change.
+    pub hook_map_generation: Arc<AtomicU64>,
     /// Function-key remapper bindings (keycode+modifiers → action). Not
     /// per-app-profile in M1 (spec non-goal), so a single shared map.
     pub keyboard_bindings: crate::runtime::hook::SharedKeyboardBindings,
+    /// Latest OS-hook capture toggle and optional event subscriptions. The
+    /// lifecycle owner applies changes without restarting HID++ sessions.
+    pub hook_capture_preferences: watch::Receiver<HookCapturePreferences>,
     /// Live smooth-scroll and vertical sensitivity settings read without
     /// taking the orchestrator/config lock.
     pub scroll_preferences: Arc<ScrollPreferences>,
@@ -108,6 +116,28 @@ pub struct SharedRuntime {
     pub receiver_access: ReceiverAccess,
     /// Keyboard → pointing-device routes resolved from `config.toml`.
     pub host_switch_links: HostSwitchLinks,
+}
+
+/// Configuration-derived requirements for the global OS input tap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HookCapturePreferences {
+    pub capture_mouse_events: bool,
+    pub interests: HookEventInterests,
+    /// Advances whenever the effective button or keyboard maps are republished.
+    pub generation: u64,
+}
+
+fn event_interests(
+    has_os_hook_gestures: bool,
+    smooth_scroll: bool,
+    vertical_sensitivity: VerticalScrollSensitivity,
+    has_keyboard_bindings: bool,
+) -> HookEventInterests {
+    HookEventInterests::new(
+        has_os_hook_gestures,
+        smooth_scroll || vertical_sensitivity != VerticalScrollSensitivity::DEFAULT,
+        has_keyboard_bindings,
+    )
 }
 
 impl SharedRuntime {
@@ -181,6 +211,8 @@ pub struct Orchestrator {
     capture_plans_tx: watch::Sender<Arc<Vec<DeviceCapturePlan>>>,
     keyboard_spec_tx: watch::Sender<Option<Arc<KeyboardSpec>>>,
     host_switch_links_tx: watch::Sender<Arc<Vec<HostSwitchLink>>>,
+    hook_capture_preferences_tx: watch::Sender<HookCapturePreferences>,
+    hook_map_generation: Arc<AtomicU64>,
     shared: SharedRuntime,
     /// The state the GUI observes. Every mutator below that changes one of its
     /// facts republishes here, so the cell cannot go stale behind a new code
@@ -214,9 +246,23 @@ impl Orchestrator {
         let (capture_plans_tx, capture_plans) = watch::channel(Arc::new(Vec::new()));
         let (keyboard_spec_tx, keyboard_spec) = watch::channel(None);
         let (host_switch_links_tx, host_switch_links) = watch::channel(Arc::new(Vec::new()));
+        let (hook_capture_preferences_tx, hook_capture_preferences) =
+            watch::channel(HookCapturePreferences {
+                capture_mouse_events: config.app_settings.capture_mouse_events,
+                interests: event_interests(
+                    false,
+                    config.app_settings.smooth_scroll,
+                    config.app_settings.vertical_scroll_sensitivity,
+                    !config.keyboard.bindings.is_empty(),
+                ),
+                generation: 0,
+            });
+        let hook_map_generation = Arc::new(AtomicU64::new(0));
         let shared = SharedRuntime {
             hook_maps: Arc::new(RwLock::new(HookMaps::default())),
+            hook_map_generation: Arc::clone(&hook_map_generation),
             keyboard_bindings: Arc::new(RwLock::new(config.keyboard.bindings.clone())),
+            hook_capture_preferences,
             scroll_preferences: Arc::new(ScrollPreferences::new(
                 config.app_settings.smooth_scroll,
                 config.app_settings.vertical_scroll_sensitivity,
@@ -248,6 +294,8 @@ impl Orchestrator {
             capture_plans_tx,
             keyboard_spec_tx,
             host_switch_links_tx,
+            hook_capture_preferences_tx,
+            hook_map_generation,
             shared,
             observable,
         };
@@ -310,6 +358,7 @@ impl Orchestrator {
                 maps.thumbwheel_positive_is_forward =
                     std::mem::take(&mut current.thumbwheel_positive_is_forward);
                 *current = maps;
+                self.hook_map_generation.fetch_add(1, Ordering::Release);
             }
             Err(error) => {
                 warn!(%error, lock = "hook_maps", "lock poisoned — keeping stale value");
@@ -388,6 +437,31 @@ impl Orchestrator {
             host_switch_links(&self.config, &self.devices),
         );
         publish_optional_arc_if_changed(&self.keyboard_spec_tx, self.keyboard_spec_for());
+        self.publish_hook_capture_preferences();
+    }
+
+    fn publish_hook_capture_preferences(&self) {
+        let maps = self.hook_maps_for(self.current_key(), self.current_app.as_deref());
+        let interests = event_interests(
+            !maps.gestures.is_empty(),
+            self.config.app_settings.smooth_scroll,
+            self.config.app_settings.vertical_scroll_sensitivity,
+            !self.config.keyboard.bindings.is_empty(),
+        );
+        let preferences = HookCapturePreferences {
+            capture_mouse_events: self.config.app_settings.capture_mouse_events,
+            interests,
+            generation: self.hook_map_generation.load(Ordering::Acquire),
+        };
+        self.hook_capture_preferences_tx
+            .send_if_modified(|current| {
+                if *current == preferences {
+                    false
+                } else {
+                    *current = preferences;
+                    true
+                }
+            });
     }
 
     fn publish_capture_plans(&self) {

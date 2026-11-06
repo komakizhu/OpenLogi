@@ -2,8 +2,8 @@
 
 use super::{
     AgentDevice, InventoryHealth, Orchestrator, VOLATILE_REAPPLY_CONFIRM_RETRIES,
-    any_device_needs_capture_rearm, build_devices, configured_wheel_mode, host_switch_links,
-    pick_current, plan_reapply, reapply_targets, stable_id,
+    any_device_needs_capture_rearm, build_devices, configured_wheel_mode, event_interests,
+    host_switch_links, pick_current, plan_reapply, reapply_targets, stable_id,
 };
 use openlogi_core::app::ForegroundApp;
 use openlogi_core::binding::{Action, Binding, ButtonId};
@@ -17,6 +17,7 @@ use openlogi_core::device::{
 use openlogi_core::device_order::{DeviceIdentity, DeviceStableId};
 use openlogi_core::hid::Dpi;
 use openlogi_hid::{DIRECT_DEVICE_INDEX, DeviceRoute};
+use openlogi_hook::HookEventInterests;
 use std::sync::Arc;
 
 use crate::observable::ObservableState;
@@ -1035,4 +1036,59 @@ fn equal_runtime_projection_does_not_wake_managers() {
             .has_changed()
             .expect("publication remains open")
     );
+}
+
+#[test]
+fn hook_interests_follow_os_gestures_scroll_settings_and_keyboard_maps() {
+    let baseline = event_interests(false, false, VerticalScrollSensitivity::DEFAULT, false);
+    assert_eq!(baseline, HookEventInterests::new(false, false, false));
+
+    let gesture = event_interests(true, false, VerticalScrollSensitivity::DEFAULT, false);
+    assert!(gesture.pointer_motion);
+
+    let adjusted_wheel = event_interests(
+        false,
+        false,
+        VerticalScrollSensitivity::from_rounded(8.0),
+        false,
+    );
+    assert_eq!(adjusted_wheel, HookEventInterests::new(false, true, false));
+
+    let smooth_wheel = event_interests(false, true, VerticalScrollSensitivity::DEFAULT, false);
+    assert!(smooth_wheel.scroll);
+
+    let keyboard = event_interests(false, false, VerticalScrollSensitivity::DEFAULT, true);
+    assert!(keyboard.keyboard);
+}
+
+#[test]
+fn hidpp_only_gestures_do_not_enable_os_pointer_motion_events() {
+    let mut config = Config::default();
+    config.set_gesture_mode("a", ButtonId::GestureButton, true);
+    let mut orch = orchestrator(config);
+    orch.devices = vec![dev("a", 1, true)];
+    orch.current = 0;
+    orch.rebuild();
+
+    let mut preferences = orch.shared.hook_capture_preferences.clone();
+    let initial = *preferences.borrow_and_update();
+    assert!(
+        !initial.interests.pointer_motion,
+        "HID++ gesture controls never reach the OS hook"
+    );
+
+    orch.config
+        .set_gesture_mode("a", ButtonId::MiddleClick, true);
+    orch.rebuild();
+    assert!(
+        preferences
+            .has_changed()
+            .expect("hook preference publisher remains open")
+    );
+    let updated = *preferences.borrow_and_update();
+    assert!(
+        updated.interests.pointer_motion,
+        "an effective OS-hook gesture requires motion and drag events"
+    );
+    assert!(updated.generation > initial.generation);
 }

@@ -11,11 +11,19 @@ use openlogi_hid::PairingError;
 
 fn shared_runtime() -> SharedRuntime {
     let (_, capture_plans) = tokio::sync::watch::channel(Arc::new(Vec::new()));
+    let (_, hook_capture_preferences) =
+        tokio::sync::watch::channel(openlogi_agent_core::orchestrator::HookCapturePreferences {
+            capture_mouse_events: true,
+            interests: openlogi_hook::HookEventInterests::new(false, false, false),
+            generation: 0,
+        });
     let (_, keyboard_spec) = tokio::sync::watch::channel(None);
     let (_, host_switch_links) = tokio::sync::watch::channel(Arc::new(Vec::new()));
     SharedRuntime {
         hook_maps: Arc::new(RwLock::new(HookMaps::default())),
+        hook_map_generation: Arc::new(0.into()),
         keyboard_bindings: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        hook_capture_preferences,
         scroll_preferences: Arc::new(ScrollPreferences::new(
             false,
             VerticalScrollSensitivity::DEFAULT,

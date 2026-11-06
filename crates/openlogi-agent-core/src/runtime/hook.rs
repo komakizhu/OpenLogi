@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -16,7 +17,8 @@ use openlogi_core::binding::{
 use openlogi_core::config::{KeyModifiers, KeyTrigger};
 use openlogi_hid::DeviceIoGate;
 use openlogi_hook::{
-    EventDevice, EventDisposition, Hook, HookEvent, KeyEvent, MouseEvent, source_is_remappable,
+    EventDevice, EventDisposition, Hook, HookEvent, HookEventInterests, KeyEvent, MouseEvent,
+    source_is_remappable,
 };
 use tracing::{info, warn};
 
@@ -59,6 +61,15 @@ pub type SharedHookMaps = Arc<RwLock<HookMaps>>;
 /// non-goals), so a single map suffices. Keyed by the config `KeyTrigger`
 /// (keycode + modifiers).
 pub type SharedKeyboardBindings = Arc<RwLock<BTreeMap<KeyTrigger, Action>>>;
+
+/// Configuration required to start a hook with optional event subscriptions.
+#[derive(Clone)]
+pub struct HookStartOptions {
+    /// Event classes currently needed by the effective maps and features.
+    pub interests: HookEventInterests,
+    /// Generation incremented whenever the effective callback maps change.
+    pub map_generation: Arc<AtomicU64>,
+}
 
 /// Convert the hook-layer modifier state into the config-layer type (the two
 /// live in different crates — core is leaf-level and duplicates the four
@@ -187,10 +198,48 @@ thread_local! {
     /// rejected the remap. Their matching release must also pass through so
     /// apps never see a stuck auxiliary button (down without up).
     static FAIL_OPEN_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
+    /// Physical presses accepted by the hook and awaiting their matching up.
+    static CAPTURED_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
+    /// Releases that must remain native after a map or tap transition.
+    static PASS_RELEASE_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
     /// Function keys whose held action owns an accepted lifecycle. Repeated
     /// key-down events are auto-repeat, not replacement presses; their first
     /// matching key-up ends the lifecycle.
     static HELD_KEYS: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+    /// Releases of held remapped keys after a map or tap transition.
+    static PASS_RELEASE_KEYS: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+    /// Last effective map generation applied to this callback thread.
+    static LAST_MAP_GENERATION: RefCell<Option<u64>> = const { RefCell::new(None) };
+}
+
+fn synchronize_map_generation(
+    generation: &AtomicU64,
+    dispatcher: &ActionDispatcher,
+    scroll: &ScrollInputHandle,
+) -> bool {
+    let current = generation.load(Ordering::Acquire);
+    let changed = LAST_MAP_GENERATION.with_borrow_mut(|last| match last.replace(current) {
+        Some(previous) => previous != current,
+        None => false,
+    });
+    if changed {
+        cancel_callback_contexts(dispatcher, scroll);
+    }
+    changed
+}
+
+fn cancel_callback_contexts(dispatcher: &ActionDispatcher, scroll: &ScrollInputHandle) {
+    HOLD.with_borrow_mut(HoldState::cancel);
+    let held_buttons = CAPTURED_PRESSES.with_borrow_mut(std::mem::take);
+    PASS_RELEASE_PRESSES.with_borrow_mut(|set| {
+        set.extend(held_buttons);
+    });
+    let held_keys = HELD_KEYS.with_borrow_mut(std::mem::take);
+    PASS_RELEASE_KEYS.with_borrow_mut(|set| {
+        set.extend(held_keys);
+    });
+    dispatcher.cancel_hook_thread_buttons();
+    scroll.cancel_hooks();
 }
 
 /// Whether a button event's physical source may be remapped/suppressed.
@@ -235,12 +284,7 @@ fn spawn_action_worker(dispatcher: ActionDispatcher) -> mpsc::SyncSender<Action>
 /// Queue a bound action without blocking the tap callback. Returns `false` if
 /// the queue is full (caller should fail open and pass the physical event).
 fn try_queue_action(tx: &mpsc::SyncSender<Action>, action: Action) -> bool {
-    if tx.try_send(action).is_err() {
-        warn!("action queue full — dropping bound action to keep the input hook live");
-        false
-    } else {
-        true
-    }
+    tx.try_send(action).is_ok()
 }
 
 /// Remap path for Middle/Back/Forward. Must stay lock-light and non-blocking.
@@ -252,8 +296,34 @@ fn handle_button(
     dispatcher: &ActionDispatcher,
 ) -> EventDisposition {
     // Primary L/R always pass through (suppressing them would brick the mouse).
-    if !id.is_os_hook_button() || !button_source_may_remap(device) {
+    if !id.is_os_hook_button() {
         return EventDisposition::PassThrough;
+    }
+
+    if pressed {
+        if PASS_RELEASE_PRESSES.with_borrow(|set| set.contains(&id)) {
+            return EventDisposition::PassThrough;
+        }
+        // A new down after a transition proves any prior unmatched up is gone.
+        FAIL_OPEN_PRESSES.with_borrow_mut(|set| set.remove(&id));
+        CAPTURED_PRESSES.with_borrow_mut(|set| set.remove(&id));
+        if !button_source_may_remap(device) {
+            PASS_RELEASE_PRESSES.with_borrow_mut(|set| {
+                set.insert(id);
+            });
+            return EventDisposition::PassThrough;
+        }
+    } else {
+        if PASS_RELEASE_PRESSES.with_borrow_mut(|set| set.remove(&id)) {
+            return EventDisposition::PassThrough;
+        }
+        let was_captured = CAPTURED_PRESSES.with_borrow_mut(|set| set.remove(&id));
+        let fail_open = FAIL_OPEN_PRESSES.with_borrow_mut(|set| {
+            remapped_release_disposition(id, set) == EventDisposition::PassThrough
+        });
+        if !was_captured || fail_open {
+            return EventDisposition::PassThrough;
+        }
     }
 
     // `try_read` only: a blocking read on the tap thread freezes every pointer
@@ -270,27 +340,31 @@ fn handle_button(
             }
             if let Some(press) = dispatcher.try_hook_button_down(id, None) {
                 HOLD.with_borrow_mut(|h| h.begin(id, press));
+                CAPTURED_PRESSES.with_borrow_mut(|set| {
+                    set.insert(id);
+                });
                 return EventDisposition::Suppress;
             }
             return FAIL_OPEN_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, false, s));
         }
-    } else {
+    } else if let Some((press, was_click)) = HOLD.with_borrow_mut(|h| h.end(id)) {
         // Drop the HOLD borrow before any queueing (re-entrancy freeze hazard).
-        let ended = HOLD.with_borrow_mut(|h| h.end(id));
-        if let Some((press, was_click)) = ended {
-            if was_click {
-                let action = hooks
-                    .try_read()
-                    .ok()
-                    .map(|m| resolve_gesture_click(&m.gestures, id));
-                if let Some(action) = action {
-                    info!(button = %id, action = %action.label(), "gesture click → executing bound action");
-                    dispatcher.try_dispatch_while_pressed(&press, &action);
-                }
+        if was_click {
+            let action = hooks
+                .try_read()
+                .ok()
+                .map(|m| resolve_gesture_click(&m.gestures, id));
+            if let Some(action) = action {
+                dispatcher.try_dispatch_while_pressed(&press, &action);
             }
-            dispatcher.try_hook_button_up(id);
-            return EventDisposition::Suppress;
         }
+        dispatcher.try_hook_button_up(id);
+        return EventDisposition::Suppress;
+    }
+
+    if !pressed {
+        dispatcher.try_hook_button_up(id);
+        return EventDisposition::Suppress;
     }
 
     let binding = hooks
@@ -298,20 +372,28 @@ fn handle_button(
         .ok()
         .and_then(|m| m.bindings.get(&id).cloned());
     let Some(binding) = binding else {
+        PASS_RELEASE_PRESSES.with_borrow_mut(|set| {
+            set.insert(id);
+        });
         return EventDisposition::PassThrough;
     };
     if binding_is_native_click(id, &binding) {
+        PASS_RELEASE_PRESSES.with_borrow_mut(|set| {
+            set.insert(id);
+        });
         return EventDisposition::PassThrough;
     }
-    if pressed {
-        info!(button = %id, action = %binding.click_action().label(), "button → handling binding");
-        let queued = dispatcher
-            .try_hook_button_down(id, Some(&binding))
-            .is_some();
-        return FAIL_OPEN_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, queued, s));
+    let queued = dispatcher
+        .try_hook_button_down(id, Some(&binding))
+        .is_some();
+    let disposition =
+        FAIL_OPEN_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, queued, s));
+    if queued {
+        CAPTURED_PRESSES.with_borrow_mut(|set| {
+            set.insert(id);
+        });
     }
-    dispatcher.try_hook_button_up(id);
-    FAIL_OPEN_PRESSES.with_borrow_mut(|s| remapped_release_disposition(id, s))
+    disposition
 }
 
 fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
@@ -334,8 +416,8 @@ fn remapped_press_disposition(
     }
 }
 
-/// Release of a remapped single-action button: pass through only when the
-/// matching press was fail-opened (queue rejection), else suppress.
+/// Release of a remapped button: pass through only when the matching press
+/// failed open; otherwise the native edge belongs to the hook.
 fn remapped_release_disposition(
     id: ButtonId,
     fail_open: &mut HashSet<ButtonId>,
@@ -373,7 +455,6 @@ fn handle_moved(
                 .unwrap_or_else(|| resolve_gesture_click(&m.gestures, button))
         });
         if let Some(action) = action {
-            info!(button = %button, ?dir, action = %action.label(), "gesture swipe → executing bound action");
             dispatcher.try_dispatch_while_pressed(&press, &action);
         }
     }
@@ -393,6 +474,9 @@ fn handle_key(
         modifiers,
     } = event;
     if !pressed {
+        if PASS_RELEASE_KEYS.with_borrow_mut(|keys| keys.remove(&keycode)) {
+            return EventDisposition::PassThrough;
+        }
         return HELD_KEYS.with_borrow_mut(|keys| {
             if keys.remove(&keycode) {
                 queued_event_disposition(dispatcher.try_hook_key_up(keycode))
@@ -400,6 +484,9 @@ fn handle_key(
                 EventDisposition::PassThrough
             }
         });
+    }
+    if PASS_RELEASE_KEYS.with_borrow(|keys| keys.contains(&keycode)) {
+        return EventDisposition::PassThrough;
     }
     if HELD_KEYS.with_borrow(|keys| keys.contains(&keycode)) {
         return EventDisposition::Suppress;
@@ -416,7 +503,6 @@ fn handle_key(
         return EventDisposition::PassThrough;
     };
 
-    info!(keycode, action = %action.label(), "key → executing bound action");
     let queued = if action.held_combo().is_some() {
         let queued = dispatcher.try_hook_key_down(keycode, &action);
         if queued {
@@ -441,6 +527,34 @@ pub fn start(
     monitor: SharedEventMonitor,
     device_io: DeviceIoGate,
 ) -> Option<Hook> {
+    start_with_interests(
+        hooks,
+        keyboard_bindings,
+        dispatcher,
+        scroll,
+        monitor,
+        device_io,
+        HookStartOptions {
+            interests: HookEventInterests::ALL,
+            map_generation: Arc::new(AtomicU64::new(0)),
+        },
+    )
+}
+
+/// Install the OS hook with configuration-derived optional event subscriptions.
+pub fn start_with_interests(
+    hooks: SharedHookMaps,
+    keyboard_bindings: SharedKeyboardBindings,
+    dispatcher: ActionDispatcher,
+    scroll: ScrollInputHandle,
+    monitor: SharedEventMonitor,
+    device_io: DeviceIoGate,
+    options: HookStartOptions,
+) -> Option<Hook> {
+    let HookStartOptions {
+        interests,
+        map_generation,
+    } = options;
     if !Hook::has_accessibility() {
         warn!(
             "Accessibility not granted — events will not be captured. \
@@ -454,63 +568,69 @@ pub fn start(
 
     // The per-hold pointer accumulator lives in the thread-local `HOLD`; the
     // callback must never block — see the freeze-hazard note in `macos.rs`.
-    let result = Hook::start(move |event| {
-        // The macOS session observer closes this gate before notifying the
-        // lifecycle task. Fail open here as well, so a tap that is still being
-        // torn down can never suppress or synthesize input for another login
-        // session. The same guard is harmless on platforms with per-device
-        // hooks and keeps the callback policy consistent everywhere.
-        if !device_io.allows_io() {
-            return EventDisposition::PassThrough;
-        }
-        match event {
-            HookEvent::Mouse(event) => {
-                monitor.record(&event);
-                match event {
-                    MouseEvent::Button {
-                        id,
-                        pressed,
-                        device,
-                    } => handle_button(id, pressed, device.as_ref(), &hooks, &dispatcher),
-                    MouseEvent::Moved { delta_x, delta_y } => {
-                        handle_moved(delta_x, delta_y, &hooks, &dispatcher)
-                    }
-                    MouseEvent::CaptureInterrupted => {
-                        HOLD.with_borrow_mut(HoldState::cancel);
-                        HELD_KEYS.with_borrow_mut(HashSet::clear);
-                        dispatcher.cancel_hook_thread_buttons();
-                        scroll.cancel_hooks();
-                        EventDisposition::PassThrough
-                    }
-                    MouseEvent::Scroll {
-                        delta,
-                        from_trackpad,
-                        device,
-                    } => {
-                        #[cfg(target_os = "windows")]
-                        if delta.y() == 0.0
-                            && let Some((button, action)) = hooks
-                                .try_read()
-                                .ok()
-                                .and_then(|maps| rebound_thumbwheel_action(&maps, delta.x()))
-                        {
-                            info!(button = %button, action = %action.label(), "native thumb wheel → executing bound action");
-                            return queued_event_disposition(try_queue_action(&action_tx, action));
+    let result = Hook::start_with_interests(
+        move |event| {
+            // The macOS session observer closes this gate before notifying the
+            // lifecycle task. Fail open here as well, so a tap that is still being
+            // torn down can never suppress or synthesize input for another login
+            // session. The same guard is harmless on platforms with per-device
+            // hooks and keeps the callback policy consistent everywhere.
+            if !device_io.allows_io() {
+                return EventDisposition::PassThrough;
+            }
+            let maps_changed = synchronize_map_generation(&map_generation, &dispatcher, &scroll);
+            match event {
+                HookEvent::Mouse(event) => {
+                    monitor.record(&event);
+                    match event {
+                        MouseEvent::Button {
+                            id,
+                            pressed,
+                            device,
+                        } => handle_button(id, pressed, device.as_ref(), &hooks, &dispatcher),
+                        MouseEvent::Moved { delta_x, delta_y } => {
+                            handle_moved(delta_x, delta_y, &hooks, &dispatcher)
                         }
-                        if scroll_source_may_intercept(from_trackpad, device.as_ref()) {
-                            return queued_event_disposition(scroll.try_hook_scroll(delta));
+                        MouseEvent::CaptureInterrupted => {
+                            if !maps_changed {
+                                cancel_callback_contexts(&dispatcher, &scroll);
+                            }
+                            EventDisposition::PassThrough
                         }
-                        EventDisposition::PassThrough
+                        MouseEvent::Scroll {
+                            delta,
+                            from_trackpad,
+                            device,
+                        } => {
+                            #[cfg(target_os = "windows")]
+                            if delta.y() == 0.0
+                                && let Some((_button, action)) = hooks
+                                    .try_read()
+                                    .ok()
+                                    .and_then(|maps| rebound_thumbwheel_action(&maps, delta.x()))
+                            {
+                                return queued_event_disposition(try_queue_action(
+                                    &action_tx, action,
+                                ));
+                            }
+                            if scroll_source_may_intercept(from_trackpad, device.as_ref()) {
+                                return queued_event_disposition(scroll.try_hook_scroll(delta));
+                            }
+                            EventDisposition::PassThrough
+                        }
                     }
                 }
+                // Function-key remapper: ordinary actions remain one-shot, while a
+                // HoldShortcut enters the same down/up/cancel lifecycle as a mouse
+                // button. The active set pairs key-up even if modifier state or config
+                // changes while the key is down.
+                HookEvent::Key(event) => {
+                    handle_key(event, &keyboard_bindings, &action_tx, &dispatcher)
+                }
             }
-            // Function-key remapper: ordinary actions remain one-shot, while a
-            // HoldShortcut enters the same down/up/cancel lifecycle as a mouse
-            // button. The active set pairs key-up even if modifier state or config
-            // changes while the key is down.
-            HookEvent::Key(event) => handle_key(event, &keyboard_bindings, &action_tx, &dispatcher),
-        }
-    });
+        },
+        interests,
+    );
 
     match result {
         Ok(hook) => {

@@ -570,13 +570,9 @@ impl ButtonInputHandle {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
                 self.generation.fetch_add(1, Ordering::AcqRel);
-                warn!("button lifecycle queue full — invalidating active presses");
                 false
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                warn!("button lifecycle worker unavailable — event ignored");
-                false
-            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
         }
     }
 
