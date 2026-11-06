@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-11-06
+
+### Fixed
+
+- Reduce macOS mouse-capture overhead while keeping button remapping available.
+
 ## [0.8.3] - 2026-08-30
 
 ### Fixed
