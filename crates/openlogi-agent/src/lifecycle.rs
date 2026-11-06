@@ -291,7 +291,7 @@ impl Wanted {
             core,
             signals,
             uninstalled,
-            capture_mouse_events: _boot_capture_mouse_events,
+            capture_mouse_events: boot_capture_mouse_events,
             #[cfg(target_os = "macos")]
             armed_tx,
             #[cfg(target_os = "macos")]
@@ -313,6 +313,8 @@ impl Wanted {
             demand,
         } = core;
         #[cfg(target_os = "macos")]
+        let _ = boot_capture_mouse_events;
+        #[cfg(target_os = "macos")]
         let hook_capture_preferences = shared.hook_capture_preferences.clone();
         #[cfg(target_os = "macos")]
         let monitor_scroll_interest = event_monitor.subscribe_scroll_interest();
@@ -321,7 +323,7 @@ impl Wanted {
         #[cfg(target_os = "macos")]
         let hook_capture_generation = hook_capture_preferences.borrow().generation;
         #[cfg(not(target_os = "macos"))]
-        let capture_mouse_events = _boot_capture_mouse_events;
+        let capture_mouse_events = boot_capture_mouse_events;
         prompt_missing_accessibility(capture_mouse_events);
         let accessibility_granted =
             observable.read(|snapshot| snapshot.status.accessibility_granted);
@@ -410,6 +412,8 @@ impl Armed {
 
         info!("openlogi-agent started");
         loop {
+            #[cfg(target_os = "macos")]
+            let retry_hook = running.should_retry_hook();
             tokio::select! {
                 Some(event) = watchers.next() => {
                     running.apply_watcher(event, &inventory_refresh).await;
@@ -442,6 +446,8 @@ impl Armed {
                         .await
                     }
                 } => {
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = changed;
                     #[cfg(target_os = "macos")]
                     if changed.is_ok() {
                         running.apply_hook_capture_preferences().await;
@@ -462,6 +468,8 @@ impl Armed {
                         .await
                     }
                 } => {
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = changed;
                     #[cfg(target_os = "macos")]
                     if changed.is_ok() {
                         running.update_hook_event_interests();
@@ -469,7 +477,15 @@ impl Armed {
                         warn!("event monitor interest channel closed");
                     }
                 }
-                _ = hook_retry.tick(), if running.should_retry_hook() => {
+                () = async {
+                    #[cfg(target_os = "macos")]
+                    if retry_hook {
+                        hook_retry.tick().await;
+                        return;
+                    }
+                    std::future::pending::<()>().await;
+                } => {
+                    #[cfg(target_os = "macos")]
                     running.retry_hook().await;
                 }
                 Some(device_key) = running.inputs.triggers.recv() => {
