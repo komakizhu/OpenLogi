@@ -188,6 +188,64 @@ pub enum MouseEvent {
     CaptureInterrupted,
 }
 
+/// The optional classes of events a hook consumer currently needs.
+///
+/// Mouse buttons are always part of a hook's event set. These switches only
+/// control high-rate pointer motion, wheel events, and keyboard events on
+/// backends that support event-level filtering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HookEventInterests {
+    /// Capture pointer moves and drags for active mouse gestures.
+    pub pointer_motion: bool,
+    /// Capture wheel input for remapping, scaling, or event diagnostics.
+    pub scroll: bool,
+    /// Capture keyboard input for configured key remaps.
+    pub keyboard: bool,
+}
+
+impl HookEventInterests {
+    /// Subscribe to every event class supported by the hook.
+    pub const ALL: Self = Self {
+        pointer_motion: true,
+        scroll: true,
+        keyboard: true,
+    };
+
+    /// Create a selection of optional event classes.
+    #[must_use]
+    pub const fn new(pointer_motion: bool, scroll: bool, keyboard: bool) -> Self {
+        Self {
+            pointer_motion,
+            scroll,
+            keyboard,
+        }
+    }
+
+    /// Compact representation shared with the macOS hook-control thread.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) const fn bits(self) -> u8 {
+        (if self.pointer_motion { 0b001 } else { 0 })
+            | (if self.scroll { 0b010 } else { 0 })
+            | (if self.keyboard { 0b100 } else { 0 })
+    }
+
+    /// Decode the compact representation written by the hook-control thread.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) const fn from_bits(bits: u8) -> Self {
+        Self {
+            pointer_motion: bits & 0b001 != 0,
+            scroll: bits & 0b010 != 0,
+            keyboard: bits & 0b100 != 0,
+        }
+    }
+}
+
+impl Default for HookEventInterests {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 /// What the hook callback wants the OS to do with the captured event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventDisposition {
@@ -232,6 +290,8 @@ pub struct EventTapInfo {
     pub active: bool,
     /// Whether the tap is currently enabled (servicing events).
     pub enabled: bool,
+    /// Core Graphics event-type subscription bitmask reported for this tap.
+    pub event_mask: u64,
     /// PID of the process that installed the tap.
     pub owner_pid: i32,
     /// Best-effort executable file name of the owner, or `None` if the process
@@ -336,7 +396,14 @@ trait HookBackend {
     /// Install the hook. [`Hook::start`] documents the contract owed to callers.
     fn start(
         cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+        interests: HookEventInterests,
     ) -> Result<Self::Running, HookError>;
+
+    /// Replace optional interests without blocking the hook callback.
+    fn update_event_interests(_running: &Self::Running, _interests: HookEventInterests) {}
+
+    /// Cancel any in-flight input context on the hook's owning thread.
+    fn cancel_in_flight(_running: &Self::Running) {}
 
     /// Stop the hook and join its threads.
     fn stop(running: Self::Running);
@@ -396,6 +463,7 @@ impl HookBackend for Unsupported {
 
     fn start(
         _cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+        _interests: HookEventInterests,
     ) -> Result<Self::Running, HookError> {
         Err(HookError::Unsupported)
     }
@@ -475,7 +543,40 @@ impl Hook {
     pub fn start(
         cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
     ) -> Result<Self, HookError> {
-        Backend::start(cb).map(|inner| Self { inner: Some(inner) })
+        Self::start_with_interests(cb, HookEventInterests::ALL)
+    }
+
+    /// Install the hook with an explicit set of optional event classes.
+    ///
+    /// Mouse buttons remain captured on every supported backend. macOS can
+    /// update the optional event classes on the owning tap thread; Linux and
+    /// Windows retain their existing event stream.
+    pub fn start_with_interests(
+        cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+        interests: HookEventInterests,
+    ) -> Result<Self, HookError> {
+        Backend::start(cb, interests).map(|inner| Self { inner: Some(inner) })
+    }
+
+    /// Request an asynchronous change to optional event classes.
+    ///
+    /// The update never blocks this caller. macOS applies it on the tap's
+    /// owning thread; other platforms ignore it and preserve their existing
+    /// event stream.
+    pub fn update_event_interests(&self, interests: HookEventInterests) {
+        if let Some(inner) = self.inner.as_ref() {
+            Backend::update_event_interests(inner, interests);
+        }
+    }
+
+    /// Request cancellation of active gesture and held-key contexts.
+    ///
+    /// macOS delivers the interruption to the callback on its tap thread.
+    /// Other platforms already cancel those contexts at their lifecycle edges.
+    pub fn cancel_in_flight(&self) {
+        if let Some(inner) = self.inner.as_ref() {
+            Backend::cancel_in_flight(inner);
+        }
     }
 
     /// Return a non-blocking request that can interrupt this hook from another

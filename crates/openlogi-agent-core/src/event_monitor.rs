@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use openlogi_hook::MouseEvent;
 use openlogi_ipc::MonitorEvent;
+use tokio::sync::watch;
 
 /// A shared [`EventMonitor`], threaded between the hook callback (writer) and
 /// the IPC server (reader/poller).
@@ -52,13 +53,16 @@ impl MonitorState {
 pub struct EventMonitor {
     state: AtomicU8,
     buf: Mutex<VecDeque<MonitorEvent>>,
+    scroll_interest: watch::Sender<bool>,
 }
 
 impl Default for EventMonitor {
     fn default() -> Self {
+        let (scroll_interest, _) = watch::channel(false);
         Self {
             state: AtomicU8::new(MonitorState::Disabled as u8),
             buf: Mutex::default(),
+            scroll_interest,
         }
     }
 }
@@ -68,6 +72,12 @@ impl EventMonitor {
     #[must_use]
     pub fn enabled(&self) -> bool {
         MonitorState::from_raw(self.state.load(Ordering::Relaxed)) != MonitorState::Disabled
+    }
+
+    /// Subscribe to changes in whether the diagnostic panel needs scroll events.
+    #[must_use]
+    pub fn subscribe_scroll_interest(&self) -> watch::Receiver<bool> {
+        self.scroll_interest.subscribe()
     }
 
     /// Record a hook event, if monitoring is on. Pointer moves are dropped: they
@@ -111,6 +121,7 @@ impl EventMonitor {
     pub fn poll(&self) -> Vec<MonitorEvent> {
         self.state
             .store(MonitorState::Polled as u8, Ordering::Release);
+        self.set_scroll_interest(true);
         self.buf
             .lock()
             .map(|mut buf| buf.drain(..).collect())
@@ -133,6 +144,7 @@ impl EventMonitor {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    self.set_scroll_interest(next != MonitorState::Disabled);
                     if next == MonitorState::Disabled
                         && let Ok(mut buf) = self.buf.lock()
                         && MonitorState::from_raw(self.state.load(Ordering::Acquire))
@@ -145,6 +157,17 @@ impl EventMonitor {
                 Err(actual) => raw = actual,
             }
         }
+    }
+
+    fn set_scroll_interest(&self, enabled: bool) {
+        self.scroll_interest.send_if_modified(|current| {
+            if *current == enabled {
+                false
+            } else {
+                *current = enabled;
+                true
+            }
+        });
     }
 
     /// Auto-disable monitoring when the GUI stops polling. Runs for the life of
@@ -223,10 +246,18 @@ mod tests {
     #[test]
     fn idle_lifecycle_requires_a_full_tick_without_a_poll_to_disable() {
         let m = EventMonitor::default();
+        let mut scroll_interest = m.subscribe_scroll_interest();
+        assert!(!*scroll_interest.borrow());
         m.idle_tick();
         assert!(!m.enabled());
 
         m.poll();
+        assert!(
+            scroll_interest
+                .has_changed()
+                .expect("interest sender remains open")
+        );
+        assert!(*scroll_interest.borrow_and_update());
         m.idle_tick();
         assert!(m.enabled(), "the first tick consumes the enabling poll");
 
@@ -239,5 +270,11 @@ mod tests {
             !m.enabled(),
             "one whole interval without a poll disables it"
         );
+        assert!(
+            scroll_interest
+                .has_changed()
+                .expect("interest sender remains open")
+        );
+        assert!(!*scroll_interest.borrow_and_update());
     }
 }

@@ -243,14 +243,7 @@ impl ScrollInputHandle {
         };
         match self.commands.try_send(ScrollCommand::Input(input)) {
             Ok(()) => true,
-            Err(mpsc::TrySendError::Full(_)) => {
-                warn!("scroll output queue full — input rejected");
-                false
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                warn!("scroll output worker unavailable — input rejected");
-                false
-            }
+            Err(mpsc::TrySendError::Full(_) | mpsc::TrySendError::Disconnected(_)) => false,
         }
     }
 

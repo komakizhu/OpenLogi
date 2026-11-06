@@ -2,6 +2,15 @@
 
 use super::*;
 
+#[test]
+fn event_interests_roundtrip_all_optional_combinations() {
+    for bits in 0..=0b111 {
+        let interests = HookEventInterests::from_bits(bits);
+        assert_eq!(interests.bits(), bits);
+    }
+    assert_eq!(HookEventInterests::default(), HookEventInterests::ALL);
+}
+
 /// All `HookError` variants produce non-empty display messages.
 #[test]
 fn hook_error_display() {
@@ -133,6 +142,7 @@ fn tap(owner: Option<&str>, location: TapLocation, active: bool, enabled: bool) 
         location,
         active,
         enabled,
+        event_mask: 0,
         owner_pid: 100,
         owner_name: owner.map(str::to_owned),
         target_pid: None,

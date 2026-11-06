@@ -6,20 +6,19 @@
 
 mod watchdog;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use core_foundation::base::{CFTypeRef, TCFType as _};
 use core_foundation::number::CFNumber;
 use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopRunResult, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    CFRunLoop, CFRunLoopRunResult, CFRunLoopSource, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::event::{
@@ -36,15 +35,15 @@ use objc2_app_kit::{
 };
 use objc2_application_services::{AXIsProcessTrusted, AXIsProcessTrustedWithOptions};
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     ButtonId, CursorPosition, EventDevice, EventDisposition, EventTapInfo, ForegroundApp,
-    HookBackend, HookError, HookEvent, HookStopHandle, KeyEvent, KeyModifiers, MouseEvent,
-    ScrollDelta, TapLocation,
+    HookBackend, HookError, HookEvent, HookEventInterests, HookStopHandle, KeyEvent, KeyModifiers,
+    MouseEvent, ScrollDelta, TapLocation,
 };
 use watchdog::{
-    CallbackActivity, LifecycleDecision, LifecycleExitReason, LifecycleObservation,
+    CallbackActivity, CallbackKind, LifecycleDecision, LifecycleExitReason, LifecycleObservation,
     LifecycleWatchdog, RearmBudget, TapPhase, WatchdogSignals, stuck_callback,
 };
 
@@ -53,6 +52,8 @@ pub(crate) struct HookInner {
     thread: thread::JoinHandle<()>,
     lifecycle_watchdog: thread::JoinHandle<()>,
     run_loop: CFRunLoop,
+    requested_interests: Arc<AtomicU8>,
+    interrupt_requested: Arc<AtomicBool>,
     /// Lifecycle signals re-checked at the top of every run-loop slice.
     /// `run_loop.stop()` only interrupts the loop while it is *inside* a
     /// `run_in_mode` slice; a stop landing in the gap between slices is
@@ -88,6 +89,26 @@ unsafe impl Sync for HookStopInner {}
 impl HookStopInner {
     fn request_stop(&self) {
         self.signals.request_stop();
+        self.run_loop.stop();
+    }
+}
+
+impl HookInner {
+    fn update_event_interests(&self, interests: HookEventInterests) {
+        if self
+            .requested_interests
+            .swap(interests.bits(), Ordering::AcqRel)
+            != interests.bits()
+        {
+            self.cancel_in_flight();
+        }
+    }
+
+    fn cancel_in_flight(&self) {
+        self.interrupt_requested.store(true, Ordering::Release);
+        // Stopping the current run-loop slice makes the tap thread apply the
+        // latest coalesced request or cancellation. The stop latch distinguishes
+        // this wake from actual hook shutdown.
         self.run_loop.stop();
     }
 }
@@ -279,54 +300,142 @@ struct SenderDeviceInfo {
     is_trackpad: bool,
 }
 
-/// Device facts for the registry id `sender_id`. A trackpad presents a *mouse*
+const SENDER_CACHE_CAPACITY: usize = 256;
+const SENDER_CACHE_TTL: Duration = Duration::from_secs(30);
+const SENDER_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SENDER_LOOKUP_QUEUE_CAPACITY: usize = 64;
+
+struct CachedSenderInfo {
+    resolved_at: Instant,
+    info: SenderDeviceInfo,
+}
+
+impl CachedSenderInfo {
+    fn ttl(&self) -> Duration {
+        if self.info.event_device.vendor_id.is_some()
+            || self.info.event_device.product_id.is_some()
+            || self.info.event_device.product_name.is_some()
+        {
+            SENDER_CACHE_TTL
+        } else {
+            SENDER_LOOKUP_RETRY_DELAY
+        }
+    }
+}
+
+#[derive(Default)]
+struct SenderCache {
+    entries: HashMap<u64, CachedSenderInfo>,
+    pending: HashSet<u64>,
+}
+
+/// Callback-safe view over device identity. Registry walks run on a dedicated
+/// worker; callbacks only use a try-lock, enqueue a bounded deduplicated lookup,
+/// and fail open until the result has arrived.
+struct SenderResolver {
+    cache: Arc<Mutex<SenderCache>>,
+    requests: mpsc::SyncSender<u64>,
+}
+
+impl SenderResolver {
+    fn new() -> Result<Self, HookError> {
+        let cache = Arc::new(Mutex::new(SenderCache::default()));
+        let worker_cache = Arc::clone(&cache);
+        let (requests, receiver) = mpsc::sync_channel(SENDER_LOOKUP_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("openlogi-hid-identity".into())
+            .spawn(move || {
+                while let Ok(sender_id) = receiver.recv() {
+                    let info = resolve_sender_device_info(sender_id);
+                    if let Ok(mut cache) = worker_cache.lock() {
+                        cache.pending.remove(&sender_id);
+                        if cache.entries.len() >= SENDER_CACHE_CAPACITY
+                            && let Some(oldest) = cache
+                                .entries
+                                .iter()
+                                .min_by_key(|(_, value)| value.resolved_at)
+                                .map(|(id, _)| *id)
+                        {
+                            cache.entries.remove(&oldest);
+                        }
+                        cache.entries.insert(
+                            sender_id,
+                            CachedSenderInfo {
+                                resolved_at: Instant::now(),
+                                info,
+                            },
+                        );
+                    }
+                }
+            })
+            .map_err(|error| {
+                HookError::MacOsTap(format!("could not start HID identity worker: {error}"))
+            })?;
+        Ok(Self { cache, requests })
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        let (requests, _receiver) = mpsc::sync_channel(SENDER_LOOKUP_QUEUE_CAPACITY);
+        Self {
+            cache: Arc::new(Mutex::new(SenderCache::default())),
+            requests,
+        }
+    }
+
+    fn device_info(&self, sender_id: u64) -> Option<SenderDeviceInfo> {
+        let Ok(mut cache) = self.cache.try_lock() else {
+            return None;
+        };
+        if let Some(entry) = cache.entries.get(&sender_id) {
+            if entry.resolved_at.elapsed() < entry.ttl() {
+                return Some(entry.info.clone());
+            }
+            cache.entries.remove(&sender_id);
+        }
+        if cache.pending.insert(sender_id) && self.requests.try_send(sender_id).is_err() {
+            cache.pending.remove(&sender_id);
+        }
+        None
+    }
+}
+
+/// Resolve device facts off the event-tap thread. A trackpad presents a *mouse*
 /// HID interface for scrolling, so usage can't separate it from a real wheel;
 /// product identity stays stable across wheel modes, unlike CGEvent phase.
-/// Cached per id because the registry walk is slow and identity never changes.
-fn sender_device_info(sender_id: u64) -> SenderDeviceInfo {
-    thread_local! {
-        static CACHE: RefCell<HashMap<u64, SenderDeviceInfo>> = RefCell::new(HashMap::new());
-    }
-    CACHE.with_borrow_mut(|cache| {
-        cache
-            .entry(sender_id)
-            .or_insert_with(|| {
-                let Some(service) = open_service(sender_id) else {
-                    return SenderDeviceInfo::default();
-                };
-                let string_prop = |k| {
-                    // SAFETY: a String property is a +1 CFString; wrap takes ownership.
-                    service_property(service, k)
-                        .map(|p| unsafe { CFString::wrap_under_create_rule(p.cast()) }.to_string())
-                };
-                let num_prop = |k| {
-                    service_property(service, k)
-                        .and_then(|p| {
-                            // SAFETY: `service_property` only yields a non-null, +1 CF
-                            // value, and every key passed below is published by IOKit as
-                            // a CFNumber, so the cast keeps the type; the create rule
-                            // hands that retain to the wrapper, which releases it on drop.
-                            unsafe { CFNumber::wrap_under_create_rule(p.cast()) }.to_i64()
-                        })
-                        .and_then(|n| u32::try_from(n).ok())
-                };
-                let product_name = string_prop("Product");
-                let info = SenderDeviceInfo {
-                    is_trackpad: product_name
-                        .as_deref()
-                        .is_some_and(|p| p.to_lowercase().contains("trackpad")),
-                    event_device: EventDevice {
-                        vendor_id: num_prop("VendorID").or_else(|| num_prop("idVendor")),
-                        product_id: num_prop("ProductID").or_else(|| num_prop("idProduct")),
-                        product_name,
-                    },
-                };
-                // SAFETY: `service` is a live io_object_t we own.
-                unsafe { IOObjectRelease(service) };
-                info
+fn resolve_sender_device_info(sender_id: u64) -> SenderDeviceInfo {
+    let Some(service) = open_service(sender_id) else {
+        return SenderDeviceInfo::default();
+    };
+    let string_prop = |key| {
+        service_property(service, key).map(|property| {
+            // SAFETY: a String property is a +1 CFString; wrap takes ownership.
+            unsafe { CFString::wrap_under_create_rule(property.cast()) }.to_string()
+        })
+    };
+    let num_prop = |key| {
+        service_property(service, key)
+            .and_then(|property| {
+                // SAFETY: `service_property` yields a non-null, +1 CF value and
+                // each queried property is published by IOKit as a CFNumber.
+                unsafe { CFNumber::wrap_under_create_rule(property.cast()) }.to_i64()
             })
-            .clone()
-    })
+            .and_then(|number| u32::try_from(number).ok())
+    };
+    let product_name = string_prop("Product");
+    let info = SenderDeviceInfo {
+        is_trackpad: product_name
+            .as_deref()
+            .is_some_and(|product| product.to_ascii_lowercase().contains("trackpad")),
+        event_device: EventDevice {
+            vendor_id: num_prop("VendorID").or_else(|| num_prop("idVendor")),
+            product_id: num_prop("ProductID").or_else(|| num_prop("idProduct")),
+            product_name,
+        },
+    };
+    // SAFETY: `service` is a live io_object_t owned by this worker.
+    unsafe { IOObjectRelease(service) };
+    info
 }
 
 /// Can this process create an *active* (event-filtering) tap right now?
@@ -362,8 +471,8 @@ fn button_number_to_id(n: i64) -> Option<ButtonId> {
 }
 
 /// Best-effort device identity for a button event's HID sender.
-fn button_source(event: &CGEvent) -> Option<crate::EventDevice> {
-    event_sender_id(event).map(|id| sender_device_info(id).event_device)
+fn button_source(event: &CGEvent, resolver: &SenderResolver) -> Option<crate::EventDevice> {
+    event_sender_id(event).and_then(|id| resolver.device_info(id).map(|info| info.event_device))
 }
 
 /// Map the macOS modifier flags on a `CGEvent` to our [`KeyModifiers`].
@@ -400,7 +509,7 @@ fn translate_key(etype: CGEventType, event: &CGEvent) -> Option<KeyEvent> {
 
 /// Convert a `CGEvent` to our [`MouseEvent`] vocabulary. Returns `None`
 /// for event types we don't translate (e.g. move events, unknown buttons).
-fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
+fn translate(etype: CGEventType, event: &CGEvent, resolver: &SenderResolver) -> Option<MouseEvent> {
     // Skip events OpenLogi itself synthesised, so a remapped click or inverted
     // scroll we posted doesn't re-enter the hook as real input. Gate the field
     // read to events we synthesize — keeping the FFI call off the high-rate
@@ -425,29 +534,29 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
         CGEventType::LeftMouseDown => Some(MouseEvent::Button {
             id: ButtonId::LeftClick,
             pressed: true,
-            device: button_source(event),
+            device: None,
         }),
         CGEventType::LeftMouseUp => Some(MouseEvent::Button {
             id: ButtonId::LeftClick,
             pressed: false,
-            device: button_source(event),
+            device: None,
         }),
         CGEventType::RightMouseDown => Some(MouseEvent::Button {
             id: ButtonId::RightClick,
             pressed: true,
-            device: button_source(event),
+            device: None,
         }),
         CGEventType::RightMouseUp => Some(MouseEvent::Button {
             id: ButtonId::RightClick,
             pressed: false,
-            device: button_source(event),
+            device: None,
         }),
         CGEventType::OtherMouseDown => {
             let n = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
             button_number_to_id(n).map(|id| MouseEvent::Button {
                 id,
                 pressed: true,
-                device: button_source(event),
+                device: button_source(event, resolver),
             })
         }
         CGEventType::OtherMouseUp => {
@@ -455,7 +564,7 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
             button_number_to_id(n).map(|id| MouseEvent::Button {
                 id,
                 pressed: false,
-                device: button_source(event),
+                device: button_source(event, resolver),
             })
         }
         CGEventType::ScrollWheel => {
@@ -482,7 +591,7 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
                 || event.get_integer_value_field(MOMENTUM_PHASE) != 0
                 || event.get_integer_value_field(SCROLL_COUNT) != 0;
             let sender = event_sender_id(event);
-            let device_info = sender.map(sender_device_info);
+            let device_info = sender.and_then(|id| resolver.device_info(id));
             let from_trackpad = device_info.as_ref().map_or(phase, |info| info.is_trackpad);
             Some(MouseEvent::Scroll {
                 delta,
@@ -615,6 +724,7 @@ impl HookBackend for Backend {
     /// Create the event tap and run loop on a dedicated thread.
     fn start(
         cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+        interests: HookEventInterests,
     ) -> Result<HookInner, HookError> {
         if !Self::has_accessibility() {
             return Err(HookError::AccessibilityDenied);
@@ -623,17 +733,31 @@ impl HookBackend for Backend {
         // Wrap in Arc so the closure handed to CGEventTap::new captures it by
         // clone rather than by move — avoids a second Box allocation.
         let cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
+        let sender_resolver = Arc::new(SenderResolver::new()?);
 
         let signals = Arc::new(WatchdogSignals::default());
+        let requested_interests = Arc::new(AtomicU8::new(interests.bits()));
+        let interrupt_requested = Arc::new(AtomicBool::new(false));
         let lifecycle_watchdog = spawn_lifecycle_watchdog(Arc::clone(&signals))?;
         let (rl_tx, rl_rx) = mpsc::channel::<CFRunLoop>();
 
         let thread = {
             let thread_signals = Arc::clone(&signals);
+            let thread_interests = Arc::clone(&requested_interests);
+            let thread_interrupt = Arc::clone(&interrupt_requested);
+            let thread_sender_resolver = Arc::clone(&sender_resolver);
             match thread::Builder::new()
                 .name("openlogi-hook".into())
-                .spawn(move || thread_main(cb, rl_tx, thread_signals))
-            {
+                .spawn(move || {
+                    thread_main(
+                        cb,
+                        rl_tx,
+                        thread_signals,
+                        thread_interests,
+                        thread_interrupt,
+                        thread_sender_resolver,
+                    );
+                }) {
                 Ok(thread) => thread,
                 Err(error) => {
                     signals.set_phase(TapPhase::ThreadExited);
@@ -666,6 +790,8 @@ impl HookBackend for Backend {
             thread,
             lifecycle_watchdog,
             run_loop,
+            requested_interests,
+            interrupt_requested,
             signals,
         })
     }
@@ -695,8 +821,19 @@ impl HookBackend for Backend {
         HookStopHandle::new(move || stop.request_stop())
     }
 
+    fn update_event_interests(inner: &HookInner, interests: HookEventInterests) {
+        inner.update_event_interests(interests);
+    }
+
+    fn cancel_in_flight(inner: &HookInner) {
+        inner.cancel_in_flight();
+    }
+
     fn is_running(inner: &HookInner) -> bool {
-        inner.signals.phase() == TapPhase::Armed
+        matches!(
+            inner.signals.phase(),
+            TapPhase::Armed | TapPhase::Reconfiguring
+        )
     }
 
     /// Check whether this process can still install the hook's event tap.
@@ -775,6 +912,7 @@ impl HookBackend for Backend {
                 // kCGEventTapOptionDefault == 0 (active); kCGEventTapOptionListenOnly == 1.
                 active: t.options == 0,
                 enabled: t.enabled,
+                event_mask: t.events_of_interest,
                 owner_pid: t.tapping_process,
                 owner_name: process_name(t.tapping_process),
                 target_pid: (t.process_being_tapped != 0).then_some(t.process_being_tapped),
@@ -813,24 +951,34 @@ impl HookBackend for Backend {
     }
 }
 
-fn hooked_event_types() -> Vec<CGEventType> {
-    vec![
+fn hooked_event_types(interests: HookEventInterests) -> Vec<CGEventType> {
+    let mut events = vec![
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
         CGEventType::RightMouseDown,
         CGEventType::RightMouseUp,
         CGEventType::OtherMouseDown,
         CGEventType::OtherMouseUp,
-        CGEventType::ScrollWheel,
-        CGEventType::MouseMoved,
-        CGEventType::LeftMouseDragged,
-        CGEventType::RightMouseDragged,
-        CGEventType::OtherMouseDragged,
+    ];
+    if interests.scroll {
+        events.push(CGEventType::ScrollWheel);
+    }
+    if interests.pointer_motion {
+        // A held button changes MouseMoved to its corresponding Dragged event.
+        events.extend([
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDragged,
+            CGEventType::RightMouseDragged,
+            CGEventType::OtherMouseDragged,
+        ]);
+    }
+    if interests.keyboard {
         // Function-key remapper: F1–F12/Esc arrive as KeyDown/KeyUp.
-        CGEventType::KeyDown,
-        CGEventType::KeyUp,
-        CGEventType::FlagsChanged,
-    ]
+        // FlagsChanged carries only independent modifier changes; modifiers
+        // are already present in the flags on each key event.
+        events.extend([CGEventType::KeyDown, CGEventType::KeyUp]);
+    }
+    events
 }
 
 /// Invoke the user callback under `catch_unwind`, always failing open.
@@ -838,10 +986,11 @@ fn run_tap_callback(
     cb: &dyn Fn(HookEvent) -> EventDisposition,
     etype: CGEventType,
     event: &CGEvent,
+    resolver: &SenderResolver,
 ) -> CallbackResult {
     let result = catch_unwind(AssertUnwindSafe(|| {
         // Mouse first, then keyboard; a given event type is one or the other.
-        let hook_event = if let Some(mouse_event) = translate(etype, event) {
+        let hook_event = if let Some(mouse_event) = translate(etype, event, resolver) {
             HookEvent::Mouse(mouse_event)
         } else if let Some(key_event) = translate_key(etype, event) {
             HookEvent::Key(key_event)
@@ -861,6 +1010,24 @@ fn run_tap_callback(
              avoid wedging system input"
         );
         CallbackResult::Keep
+    }
+}
+
+fn callback_kind(etype: CGEventType) -> CallbackKind {
+    match etype {
+        CGEventType::LeftMouseDown
+        | CGEventType::LeftMouseUp
+        | CGEventType::RightMouseDown
+        | CGEventType::RightMouseUp
+        | CGEventType::OtherMouseDown
+        | CGEventType::OtherMouseUp => CallbackKind::Button,
+        CGEventType::ScrollWheel => CallbackKind::Scroll,
+        CGEventType::MouseMoved
+        | CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged
+        | CGEventType::OtherMouseDragged => CallbackKind::PointerMotion,
+        CGEventType::KeyDown | CGEventType::KeyUp => CallbackKind::Keyboard,
+        _ => CallbackKind::Other,
     }
 }
 
@@ -895,6 +1062,7 @@ fn spawn_callback_watchdog(
                 }
                 error!(
                     stuck_ms = duration_millis(elapsed),
+                    callback_kind = callback_activity.active_kind().label(),
                     "OS mouse-hook callback stuck past budget — exiting agent to \
                      restore system input (HID CGEventTap freeze hazard)"
                 );
@@ -945,7 +1113,10 @@ fn spawn_lifecycle_watchdog(
                         let phase = signals.phase();
                         let still_hazardous = match reason {
                             LifecycleExitReason::TapThreadStalled => {
-                                matches!(phase, TapPhase::Arming | TapPhase::Armed)
+                                matches!(
+                                    phase,
+                                    TapPhase::Arming | TapPhase::Armed | TapPhase::Reconfiguring
+                                )
                             }
                             LifecycleExitReason::StopTimedOut => phase != TapPhase::ThreadExited,
                         };
@@ -955,6 +1126,11 @@ fn spawn_lifecycle_watchdog(
                         let reason = match reason {
                             LifecycleExitReason::TapThreadStalled if phase == TapPhase::Arming => {
                                 "HID tap creation or activation stopped making progress"
+                            }
+                            LifecycleExitReason::TapThreadStalled
+                                if phase == TapPhase::Reconfiguring =>
+                            {
+                                "HID tap thread stopped making progress while updating the event mask"
                             }
                             LifecycleExitReason::TapThreadStalled => {
                                 "HID tap thread stopped making progress while tap remained active"
@@ -982,9 +1158,24 @@ fn spawn_lifecycle_watchdog(
         .map_err(|error| HookError::MacOsTap(format!("could not spawn tap watchdog: {error}")))
 }
 
-/// Service the tap until it has to be released: an explicit stop, a stopped run
-/// loop, a revoked permission, or a tap the OS will not keep enabled.
-fn service_tap(tap: &CGEventTap<'_>, signals: &WatchdogSignals, tap_disabled: &AtomicBool) {
+enum TapServiceResult {
+    Stop,
+    Interrupt,
+    Reconfigure(HookEventInterests),
+    Release,
+}
+
+/// Service one tap until shutdown, reconfiguration, revoked permission, or a
+/// tap the OS will not keep enabled.
+fn service_tap(
+    tap: &CGEventTap<'_>,
+    signals: &WatchdogSignals,
+    tap_disabled: &AtomicBool,
+    requested_interests: &AtomicU8,
+    interrupt_requested: &AtomicBool,
+    callback_activity: &CallbackActivity,
+    current_interests: HookEventInterests,
+) -> TapServiceResult {
     // Service the tap in short slices instead of an unbounded
     // `run_current()`. Between slices we re-check that we may still filter
     // events: an active tap at the HID location that outlives its permission
@@ -1001,9 +1192,10 @@ fn service_tap(tap: &CGEventTap<'_>, signals: &WatchdogSignals, tap_disabled: &A
     // that race the thread notices one 500 ms slice later instead of joining
     // forever.
     let mut rearm = RearmBudget::default();
+    let mut metrics_at = Instant::now() + Duration::from_secs(10);
     loop {
         if signals.stop_requested() {
-            break;
+            return TapServiceResult::Stop;
         }
         signals.mark_tap_progress();
         match CFRunLoop::run_in_mode(
@@ -1012,16 +1204,46 @@ fn service_tap(tap: &CGEventTap<'_>, signals: &WatchdogSignals, tap_disabled: &A
             Duration::from_millis(500),
             false,
         ) {
-            CFRunLoopRunResult::Stopped | CFRunLoopRunResult::Finished => break,
-            CFRunLoopRunResult::TimedOut | CFRunLoopRunResult::HandledSource => {}
+            CFRunLoopRunResult::Stopped | CFRunLoopRunResult::Finished
+                if signals.stop_requested() =>
+            {
+                return TapServiceResult::Stop;
+            }
+            CFRunLoopRunResult::Stopped
+            | CFRunLoopRunResult::Finished
+            | CFRunLoopRunResult::TimedOut
+            | CFRunLoopRunResult::HandledSource => {}
         }
         signals.mark_tap_progress();
+        if Instant::now() >= metrics_at {
+            let metrics = callback_activity.take_metrics();
+            debug!(
+                buttons = metrics.buttons,
+                scroll = metrics.scroll,
+                pointer_motion = metrics.pointer_motion,
+                keyboard = metrics.keyboard,
+                other = metrics.other,
+                max_callback_us = metrics.max_duration_nanos / 1_000,
+                ?current_interests,
+                "macOS event tap callback summary"
+            );
+            metrics_at = Instant::now() + Duration::from_secs(10);
+        }
+        let next_interests =
+            HookEventInterests::from_bits(requested_interests.load(Ordering::Acquire));
+        let was_interrupted = interrupt_requested.swap(false, Ordering::AcqRel);
+        if next_interests != current_interests {
+            return TapServiceResult::Reconfigure(next_interests);
+        }
+        if was_interrupted {
+            return TapServiceResult::Interrupt;
+        }
         if !Backend::has_accessibility() {
             warn!(
                 "Accessibility revoked while the event tap was live — \
                  disabling the tap to avoid wedging system input"
             );
-            break;
+            return TapServiceResult::Release;
         }
         // Observe both disable signals: the callback catches the documented
         // TapDisabledBy* notification, while the port state catches the
@@ -1033,7 +1255,7 @@ fn service_tap(tap: &CGEventTap<'_>, signals: &WatchdogSignals, tap_disabled: &A
                 "the OS keeps disabling the HID tap — releasing it instead of \
                  re-arming a tap nothing is servicing"
             );
-            break;
+            return TapServiceResult::Release;
         }
         // Enabling is idempotent while the tap is already live. Only reached
         // while the live capability probe above still succeeds.
@@ -1050,6 +1272,9 @@ fn thread_main(
     cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
     rl_tx: mpsc::Sender<CFRunLoop>,
     signals: Arc<WatchdogSignals>,
+    requested_interests: Arc<AtomicU8>,
+    interrupt_requested: Arc<AtomicBool>,
+    sender_resolver: Arc<SenderResolver>,
 ) {
     // Declared first so it drops last, after the tap, callback, source, and run
     // loop locals have unwound. The lifecycle watchdog treats this notification
@@ -1066,31 +1291,15 @@ fn thread_main(
     // run-loop slice that decides whether to re-arm it.
     let tap_disabled = Arc::new(AtomicBool::new(false));
 
-    let tap_result = {
-        let callback_signals = Arc::clone(&signals);
-        let callback_activity = Arc::clone(&callback_activity);
-        let tap_disabled = Arc::clone(&tap_disabled);
-        CGEventTap::new(
-            CGEventTapLocation::HID,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            hooked_event_types(),
-            move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
-                if matches!(
-                    etype,
-                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-                ) {
-                    tap_disabled.store(true, Ordering::Release);
-                }
-                callback_activity.enter(callback_signals.now_millis());
-                let disposition = run_tap_callback(cb.as_ref(), etype, event);
-                callback_activity.exit();
-                disposition
-            },
-        )
-    };
-
-    let Ok(tap) = tap_result else {
+    let mut interests = HookEventInterests::from_bits(requested_interests.load(Ordering::Acquire));
+    let Ok(mut tap) = create_tap(
+        &cb,
+        interests,
+        &signals,
+        &callback_activity,
+        &tap_disabled,
+        &sender_resolver,
+    ) else {
         error!("CGEventTapCreate returned null — Accessibility may have been revoked");
         // Dropping rl_tx causes rl_rx.recv() on the parent to return Err,
         // which we surface as MacOsTap.
@@ -1098,7 +1307,7 @@ fn thread_main(
     };
     signals.mark_tap_progress();
 
-    let Ok(loop_source) = tap.mach_port().create_runloop_source(0) else {
+    let Ok(mut loop_source) = tap.mach_port().create_runloop_source(0) else {
         error!("CFRunLoopSourceCreate failed for event tap");
         return;
     };
@@ -1125,26 +1334,173 @@ fn thread_main(
 
     if rl_tx.send(run_loop.clone()).is_err() {
         debug!("hook parent dropped before run loop was ready; stopping");
-        disable_tap(&tap);
-        // SAFETY: framework-provided static CFStringRef, 'static.
-        run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
-        drop(loop_source);
-        drop(tap);
+        detach_tap(tap, loop_source, &run_loop);
         signals.set_phase(TapPhase::TapStopped);
         return;
     }
 
-    service_tap(&tap, &signals, &tap_disabled);
+    loop {
+        let result = service_tap(
+            &tap,
+            &signals,
+            &tap_disabled,
+            &requested_interests,
+            &interrupt_requested,
+            &callback_activity,
+            interests,
+        );
+        let reconfigure = match result {
+            TapServiceResult::Stop | TapServiceResult::Release => {
+                notify_capture_interrupted(cb.as_ref());
+                None
+            }
+            TapServiceResult::Reconfigure(next) => {
+                notify_capture_interrupted(cb.as_ref());
+                Some(next)
+            }
+            TapServiceResult::Interrupt => {
+                notify_capture_interrupted(cb.as_ref());
+                signals.mark_tap_progress();
+                signals.set_phase(TapPhase::Armed);
+                continue;
+            }
+        };
 
-    // Detach the tap from the event stream synchronously before unwinding,
-    // so input recovers immediately rather than whenever CF happens to
-    // release the port.
-    disable_tap(&tap);
-    // SAFETY: framework-provided static CFStringRef, 'static.
-    run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
-    drop(loop_source);
-    drop(tap);
+        // The old tap is always detached on its owning thread before another
+        // is created. During the handoff, all physical input is native.
+        signals.set_phase(if reconfigure.is_some() {
+            TapPhase::Reconfiguring
+        } else {
+            TapPhase::Arming
+        });
+        signals.mark_tap_progress();
+        detach_tap(tap, loop_source, &run_loop);
+
+        let Some(_) = reconfigure else {
+            break;
+        };
+        if signals.stop_requested() {
+            break;
+        }
+        interests = HookEventInterests::from_bits(requested_interests.load(Ordering::Acquire));
+        let Some((next_tap, next_source)) = create_reconfigured_tap(
+            &cb,
+            interests,
+            &run_loop,
+            &signals,
+            &callback_activity,
+            &tap_disabled,
+            &sender_resolver,
+        ) else {
+            break;
+        };
+        tap = next_tap;
+        loop_source = next_source;
+    }
+
     signals.set_phase(TapPhase::TapStopped);
+}
+
+fn detach_tap(tap: CGEventTap<'static>, source: CFRunLoopSource, run_loop: &CFRunLoop) {
+    disable_tap(&tap);
+    // SAFETY: kCFRunLoopCommonModes is a process-lifetime framework constant.
+    run_loop.remove_source(&source, unsafe { kCFRunLoopCommonModes });
+    drop(source);
+    drop(tap);
+}
+
+fn create_reconfigured_tap(
+    cb: &Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
+    interests: HookEventInterests,
+    run_loop: &CFRunLoop,
+    signals: &Arc<WatchdogSignals>,
+    callback_activity: &Arc<CallbackActivity>,
+    tap_disabled: &Arc<AtomicBool>,
+    sender_resolver: &Arc<SenderResolver>,
+) -> Option<(CGEventTap<'static>, CFRunLoopSource)> {
+    let Ok(tap) = create_tap(
+        cb,
+        interests,
+        signals,
+        callback_activity,
+        tap_disabled,
+        sender_resolver,
+    ) else {
+        error!(
+            ?interests,
+            "CGEventTap recreation failed after event-interest update"
+        );
+        return None;
+    };
+    let Ok(source) = tap.mach_port().create_runloop_source(0) else {
+        error!("CFRunLoopSourceCreate failed during event-interest update");
+        disable_tap(&tap);
+        return None;
+    };
+    // SAFETY: the newly created source belongs to this hook thread's run loop.
+    unsafe {
+        run_loop.add_source(&source, kCFRunLoopCommonModes);
+    }
+    signals.mark_tap_progress();
+    if !Backend::has_accessibility() {
+        warn!("Accessibility was revoked while updating the event tap");
+        disable_tap(&tap);
+        // SAFETY: kCFRunLoopCommonModes is a process-lifetime framework constant.
+        run_loop.remove_source(&source, unsafe { kCFRunLoopCommonModes });
+        return None;
+    }
+    tap.enable();
+    signals.mark_tap_progress();
+    signals.set_phase(TapPhase::Armed);
+    info!(?interests, "macOS event tap interests updated");
+    Some((tap, source))
+}
+
+fn create_tap(
+    cb: &Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
+    interests: HookEventInterests,
+    signals: &Arc<WatchdogSignals>,
+    callback_activity: &Arc<CallbackActivity>,
+    tap_disabled: &Arc<AtomicBool>,
+    sender_resolver: &Arc<SenderResolver>,
+) -> Result<CGEventTap<'static>, HookError> {
+    // A previous tap may have been disabled just as a new interest request
+    // arrived. The replacement has its own enable state.
+    tap_disabled.store(false, Ordering::Release);
+    let callback_signals = Arc::clone(signals);
+    let callback_activity = Arc::clone(callback_activity);
+    let tap_disabled = Arc::clone(tap_disabled);
+    let callback = Arc::clone(cb);
+    let sender_resolver = Arc::clone(sender_resolver);
+    CGEventTap::new(
+        CGEventTapLocation::HID,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::Default,
+        hooked_event_types(interests),
+        move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
+            if matches!(
+                etype,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                tap_disabled.store(true, Ordering::Release);
+            }
+            let started_at = callback_signals.now_nanos();
+            callback_activity.enter(started_at / 1_000_000 + 1, callback_kind(etype));
+            let disposition = run_tap_callback(callback.as_ref(), etype, event, &sender_resolver);
+            callback_activity.exit(callback_signals.now_nanos().saturating_sub(started_at));
+            disposition
+        },
+    )
+    .map_err(|()| HookError::MacOsTap("CGEventTapCreate returned null".into()))
+}
+
+fn notify_capture_interrupted(cb: &dyn Fn(HookEvent) -> EventDisposition) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        cb(HookEvent::Mouse(MouseEvent::CaptureInterrupted))
+    }));
+    if result.is_err() {
+        error!("capture-interruption callback panicked during tap update");
+    }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -1236,16 +1592,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unresolved_sender_lookups_are_retryable_and_queue_full_does_not_stick_pending() {
+        let unresolved = CachedSenderInfo {
+            resolved_at: Instant::now(),
+            info: SenderDeviceInfo::default(),
+        };
+        assert_eq!(unresolved.ttl(), SENDER_LOOKUP_RETRY_DELAY);
+
+        let (requests, _receiver) = mpsc::sync_channel(1);
+        requests.try_send(1).unwrap();
+        let resolver = SenderResolver {
+            cache: Arc::new(Mutex::new(SenderCache::default())),
+            requests,
+        };
+
+        assert!(resolver.device_info(2).is_none());
+        assert!(
+            !resolver.cache.lock().unwrap().pending.contains(&2),
+            "a full request queue must not leave a sender permanently pending"
+        );
+    }
+
+    #[test]
+    fn identified_sender_entries_use_the_normal_cache_ttl() {
+        let identified = CachedSenderInfo {
+            resolved_at: Instant::now(),
+            info: SenderDeviceInfo {
+                event_device: EventDevice {
+                    vendor_id: Some(crate::LOGITECH_VENDOR_ID),
+                    ..EventDevice::default()
+                },
+                is_trackpad: false,
+            },
+        };
+        assert_eq!(identified.ttl(), SENDER_CACHE_TTL);
+    }
+
+    #[test]
+    fn tap_subscriptions_follow_optional_interests_and_keep_buttons() {
+        let buttons_only = hooked_event_types(HookEventInterests::new(false, false, false));
+        let contains = |types: &[CGEventType], wanted: CGEventType| {
+            types
+                .iter()
+                .any(|event_type| *event_type as u32 == wanted as u32)
+        };
+        assert!(contains(&buttons_only, CGEventType::OtherMouseDown));
+        assert!(contains(&buttons_only, CGEventType::OtherMouseUp));
+        assert!(!contains(&buttons_only, CGEventType::ScrollWheel));
+        assert!(!contains(&buttons_only, CGEventType::MouseMoved));
+        assert!(!contains(&buttons_only, CGEventType::OtherMouseDragged));
+        assert!(!contains(&buttons_only, CGEventType::KeyDown));
+        assert!(!contains(&buttons_only, CGEventType::FlagsChanged));
+
+        let all = hooked_event_types(HookEventInterests::ALL);
+        for event_type in [
+            CGEventType::ScrollWheel,
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDragged,
+            CGEventType::RightMouseDragged,
+            CGEventType::OtherMouseDragged,
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+        ] {
+            assert!(
+                contains(&all, event_type),
+                "missing subscription {event_type:?}"
+            );
+        }
+        assert!(!contains(&all, CGEventType::FlagsChanged));
+    }
+
+    #[test]
     fn tap_callback_suppresses_normally_and_passes_through_panics() {
         let source = CGEventSource::new(CGEventSourceStateID::Private)
             .expect("CGEventSourceCreate must succeed");
         let event = CGEvent::new(source).expect("CGEventCreate must succeed");
+        let resolver = SenderResolver::empty();
 
         assert!(matches!(
             run_tap_callback(
                 &|_| EventDisposition::Suppress,
                 CGEventType::MouseMoved,
-                &event
+                &event,
+                &resolver,
             ),
             CallbackResult::Drop
         ));
@@ -1253,7 +1682,8 @@ mod tests {
             run_tap_callback(
                 &|_| panic!("test callback panic"),
                 CGEventType::MouseMoved,
-                &event
+                &event,
+                &resolver,
             ),
             CallbackResult::Keep
         ));

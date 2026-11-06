@@ -172,8 +172,8 @@ fn debug_tap_list(taps: &[openlogi_hook::EventTapInfo], pal: Palette) -> impl In
         let owner = tap.owner_name.as_deref().unwrap_or("(unknown)");
         let mode = if tap.active { "active" } else { "listen" };
         let line = format!(
-            "{owner} (pid {}) — {:?} {mode} enabled={}",
-            tap.owner_pid, tap.location, tap.enabled
+            "{owner} (pid {}) — {:?} {mode} enabled={} mask={:#018x}",
+            tap.owner_pid, tap.location, tap.enabled, tap.event_mask
         );
         let row = div().text_caption().child(line);
         let row = if tap.gates_input() {

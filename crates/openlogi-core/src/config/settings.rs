@@ -190,7 +190,7 @@ pub struct AppSettings {
     /// (on Linux: no exclusive grabs at all; on macOS the agent also skips
     /// the startup Accessibility prompt). HID++-side features — DPI,
     /// SmartShift, the gesture button, the thumb wheel — are unaffected.
-    /// Takes effect on agent restart.
+    /// Takes effect when the running agent reloads the configuration.
     #[serde(default = "default_true")]
     pub capture_mouse_events: bool,
     /// Whether ordinary mouse-wheel input is replaced with a finite smooth

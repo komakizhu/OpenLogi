@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::windows_worker::{WorkerEvent, WorkerPhase, WorkerStatus};
 use crate::{
     ButtonId, CursorPosition, EventDisposition, ForegroundApp, HookBackend, HookError, HookEvent,
-    KeyEvent, KeyModifiers, MouseEvent, ScrollDelta,
+    HookEventInterests, KeyEvent, KeyModifiers, MouseEvent, ScrollDelta,
 };
 
 pub(crate) mod foreground;
@@ -68,6 +68,7 @@ impl HookBackend for Backend {
 
     fn start(
         cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+        _interests: HookEventInterests,
     ) -> Result<HookInner, HookError> {
         let callback: HookCallback = Arc::new(cb);
         let (ready_tx, ready_rx) = mpsc::channel();

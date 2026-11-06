@@ -187,8 +187,8 @@ struct Booted {
     core: Core,
     signals: ShutdownSignals,
     uninstalled: UnboundedReceiver<()>,
-    /// The hook kill-switch, startup-only on purpose: flipping it requires
-    /// an agent restart, which the config docs state.
+    /// Current configuration toggle for the global OS hook; configuration
+    /// reloads update it while the agent is running.
     capture_mouse_events: bool,
     #[cfg(target_os = "macos")]
     launch_at_login: bool,
@@ -291,7 +291,7 @@ impl Wanted {
             core,
             signals,
             uninstalled,
-            capture_mouse_events,
+            capture_mouse_events: _boot_capture_mouse_events,
             #[cfg(target_os = "macos")]
             armed_tx,
             #[cfg(target_os = "macos")]
@@ -302,7 +302,6 @@ impl Wanted {
         #[cfg(target_os = "macos")]
         let _ = armed_tx.send(());
         overlay::spawn();
-        prompt_missing_accessibility(capture_mouse_events);
 
         let Core {
             orchestrator,
@@ -313,6 +312,17 @@ impl Wanted {
             ring_haptics,
             demand,
         } = core;
+        #[cfg(target_os = "macos")]
+        let hook_capture_preferences = shared.hook_capture_preferences.clone();
+        #[cfg(target_os = "macos")]
+        let monitor_scroll_interest = event_monitor.subscribe_scroll_interest();
+        #[cfg(target_os = "macos")]
+        let capture_mouse_events = hook_capture_preferences.borrow().capture_mouse_events;
+        #[cfg(target_os = "macos")]
+        let hook_capture_generation = hook_capture_preferences.borrow().generation;
+        #[cfg(not(target_os = "macos"))]
+        let capture_mouse_events = _boot_capture_mouse_events;
+        prompt_missing_accessibility(capture_mouse_events);
         let accessibility_granted =
             observable.read(|snapshot| snapshot.status.accessibility_granted);
         // Closing the channel turns post-arming declarations into no-ops in
@@ -333,6 +343,12 @@ impl Wanted {
                 accessibility_granted,
                 #[cfg(target_os = "macos")]
                 hook_stop,
+                #[cfg(target_os = "macos")]
+                hook_capture_preferences,
+                #[cfg(target_os = "macos")]
+                monitor_scroll_interest,
+                #[cfg(target_os = "macos")]
+                hook_capture_generation,
                 device_io_gate,
             },
         }
@@ -363,6 +379,13 @@ struct Running {
     accessibility_granted: bool,
     #[cfg(target_os = "macos")]
     hook_stop: Arc<HookStopRequest>,
+    #[cfg(target_os = "macos")]
+    hook_capture_preferences:
+        tokio::sync::watch::Receiver<openlogi_agent_core::orchestrator::HookCapturePreferences>,
+    #[cfg(target_os = "macos")]
+    monitor_scroll_interest: tokio::sync::watch::Receiver<bool>,
+    #[cfg(target_os = "macos")]
+    hook_capture_generation: u64,
     device_io_gate: openlogi_hid::DeviceIoGate,
 }
 
@@ -387,8 +410,6 @@ impl Armed {
 
         info!("openlogi-agent started");
         loop {
-            #[cfg(target_os = "macos")]
-            let retry_hook = running.should_retry_hook();
             tokio::select! {
                 Some(event) = watchers.next() => {
                     running.apply_watcher(event, &inventory_refresh).await;
@@ -408,15 +429,47 @@ impl Armed {
                         break;
                     }
                 }
-                () = async {
+                changed = async {
                     #[cfg(target_os = "macos")]
-                    if retry_hook {
-                        hook_retry.tick().await;
-                        return;
+                    {
+                        running.hook_capture_preferences.changed().await
                     }
-                    std::future::pending::<()>().await;
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        std::future::pending::<
+                            Result<(), tokio::sync::watch::error::RecvError>,
+                        >()
+                        .await
+                    }
                 } => {
                     #[cfg(target_os = "macos")]
+                    if changed.is_ok() {
+                        running.apply_hook_capture_preferences().await;
+                    } else {
+                        warn!("hook capture preference channel closed");
+                    }
+                }
+                changed = async {
+                    #[cfg(target_os = "macos")]
+                    {
+                        running.monitor_scroll_interest.changed().await
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        std::future::pending::<
+                            Result<(), tokio::sync::watch::error::RecvError>,
+                        >()
+                        .await
+                    }
+                } => {
+                    #[cfg(target_os = "macos")]
+                    if changed.is_ok() {
+                        running.update_hook_event_interests();
+                    } else {
+                        warn!("event monitor interest channel closed");
+                    }
+                }
+                _ = hook_retry.tick(), if running.should_retry_hook() => {
                     running.retry_hook().await;
                 }
                 Some(device_key) = running.inputs.triggers.recv() => {
@@ -433,6 +486,32 @@ impl Armed {
 }
 
 impl Running {
+    #[cfg(target_os = "macos")]
+    async fn apply_hook_capture_preferences(&mut self) {
+        let preferences = *self.hook_capture_preferences.borrow_and_update();
+        let capture_changed = self.capture_mouse_events != preferences.capture_mouse_events;
+        let maps_changed = self.hook_capture_generation != preferences.generation;
+        self.hook_capture_generation = preferences.generation;
+        self.capture_mouse_events = preferences.capture_mouse_events;
+        if maps_changed && let Some(hook) = &self.hook {
+            hook.cancel_in_flight();
+        }
+        if capture_changed {
+            self.apply_accessibility(self.accessibility_granted).await;
+        } else {
+            self.update_hook_event_interests();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn update_hook_event_interests(&self) {
+        let mut interests = self.hook_capture_preferences.borrow().interests;
+        interests.scroll |= *self.monitor_scroll_interest.borrow();
+        if let Some(hook) = &self.hook {
+            hook.update_event_interests(interests);
+        }
+    }
+
     /// Retire a terminal Windows hook worker and publish that input capture is
     /// no longer installed. The native callbacks have already been cleared,
     /// so the interval before this check remains pass-through rather than
@@ -648,6 +727,26 @@ impl Running {
             return None;
         }
         info!("accessibility granted — installing OS mouse hook");
+        #[cfg(target_os = "macos")]
+        let interests = {
+            let mut interests = self.hook_capture_preferences.borrow().interests;
+            interests.scroll |= *self.monitor_scroll_interest.borrow();
+            interests
+        };
+        #[cfg(target_os = "macos")]
+        let hook = hook::start_with_interests(
+            self.shared.hook_maps.clone(),
+            self.shared.keyboard_bindings.clone(),
+            self.inputs.dispatcher.clone(),
+            self.inputs.scroll_input.clone(),
+            Arc::clone(&self.event_monitor),
+            self.shared.device_io.clone(),
+            hook::HookStartOptions {
+                interests,
+                map_generation: Arc::clone(&self.shared.hook_map_generation),
+            },
+        );
+        #[cfg(not(target_os = "macos"))]
         let hook = hook::start(
             self.shared.hook_maps.clone(),
             self.shared.keyboard_bindings.clone(),
