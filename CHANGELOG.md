@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Reduce macOS mouse-capture overhead while keeping button remapping available.
+- Update TLS and Tokio dependencies to patched versions.
 
 ## [0.8.3] - 2026-08-30
 
